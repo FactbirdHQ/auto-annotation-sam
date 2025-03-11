@@ -298,26 +298,25 @@ class MultiLayerFeatureKNN:
         
         return True
     
-    def predict(self, image, candidate_masks, threshold=None, return_scores=True):
+    def predict(self, image, candidate_masks, return_probabilities=True):
         """
-        Predict whether candidate masks are similar to the positive examples
+        Predict whether candidate masks are of the positive class
         
         Args:
             image: Input image
             candidate_masks: List of candidate segmentation masks
-            threshold: Distance threshold (if None, use statistical threshold)
-            return_scores: Whether to return similarity scores
+            return_probabilities: Whether to return class probabilities
         
         Returns:
-            filtered_masks: List of masks that are similar to positive examples
-            similarity_scores: (Optional) Similarity scores for each filtered mask
+            filtered_masks: List of masks classified as positive
+            probabilities: (Optional) Probability scores for each filtered mask
         """
         if not candidate_masks or len(candidate_masks) == 0:
-            if return_scores:
+            if return_probabilities:
                 return [], []
             else:
                 return []
-            
+                
         # Extract features for all candidate masks
         features = []
         valid_masks = []
@@ -332,7 +331,7 @@ class MultiLayerFeatureKNN:
                 continue
         
         if not features:
-            if return_scores:
+            if return_probabilities:
                 return [], []
             else:
                 return []
@@ -341,25 +340,20 @@ class MultiLayerFeatureKNN:
         if self.pca is not None:
             features = self.pca.transform(features)
         
-        # Get distances to nearest neighbors
-        distances, indices = self.knn.kneighbors(features)
+        # Get class predictions and probabilities
+        predictions = self.knn.predict(features)
+        if return_probabilities:
+            probabilities = self.knn.predict_proba(features)
+            # Get the probability of positive class (assumes binary classification)
+            positive_probabilities = probabilities[:, 1] if probabilities.shape[1] > 1 else probabilities[:, 0]
         
-        # Convert distances to similarity scores (inverse distance)
-        similarity_scores = 1.0 / (1.0 + np.mean(distances, axis=1))
-        
-        # Determine threshold for filtering
-        if threshold is None:
-            # Statistical threshold based on distances
-            threshold = np.mean(distances) + np.std(distances)
-            print(f'Using statistical threshold: {threshold:4.3}')
-        
-        # Filter masks based on distance threshold
-        filtered_indices = [i for i, d in enumerate(distances) if np.mean(d) <= threshold]
+        # Filter masks based on predictions
+        filtered_indices = [i for i, pred in enumerate(predictions) if pred == 1]  # Keep positive predictions
         filtered_masks = [valid_masks[i] for i in filtered_indices]
-        filtered_scores = [similarity_scores[i] for i in filtered_indices]
         
-        if return_scores:
-            return filtered_masks, filtered_scores
+        if return_probabilities:
+            filtered_probs = [positive_probabilities[i] for i in filtered_indices]
+            return filtered_masks, filtered_probs
         else:
             return filtered_masks
     
