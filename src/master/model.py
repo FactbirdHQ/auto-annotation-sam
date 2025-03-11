@@ -94,22 +94,51 @@ class MultiLayerFeatureKNN:
             x_min = max(0, x_min - padding)
             x_max = min(mask.shape[1], x_max + padding)
             
-            # Crop the image to the bounding box
-            cropped_image = np.array(image)[y_min:y_max, x_min:x_max]
-            cropped_mask = mask[y_min:y_max, x_min:x_max]
-            
-            # Convert back to PIL for processing
-            cropped_image = Image.fromarray(cropped_image.astype(np.uint8))
-            
-            # Apply mask to the cropped image
-            masked_image = np.array(cropped_image)
-            if len(masked_image.shape) == 3:  # RGB image
-                for c in range(3):  # Apply mask to each channel
-                    masked_image[:, :, c] = masked_image[:, :, c] * cropped_mask
-            else:  # Grayscale image
-                masked_image = masked_image * cropped_mask
+            # Check if the bounding box is valid (has positive width and height)
+            if x_max <= x_min or y_max <= y_min:
+                # Invalid bounding box, use the entire image instead
+                masked_image = np.array(image)
+            else:
+                # Crop the image to the bounding box
+                cropped_image = np.array(image)[y_min:y_max, x_min:x_max]
+                cropped_mask = mask[y_min:y_max, x_min:x_max]
                 
-            masked_image = Image.fromarray(masked_image.astype(np.uint8))
+                # Check cropped image and mask dimensions
+                if cropped_image.size == 0 or cropped_mask.size == 0:
+                    # Empty crop, use the original image
+                    masked_image = np.array(image)
+                else:
+                    # Convert back to PIL for processing
+                    cropped_image = Image.fromarray(cropped_image.astype(np.uint8))
+                    
+                    # Apply mask to the cropped image
+                    masked_image = np.array(cropped_image)
+                    
+                    # Handle dimension mismatch between image and mask
+                    if len(masked_image.shape) == 3:  # RGB image
+                        for c in range(3):  # Apply mask to each channel
+                            # Ensure mask shape matches the image channel
+                            if masked_image[:, :, c].shape == cropped_mask.shape:
+                                masked_image[:, :, c] = masked_image[:, :, c] * cropped_mask
+                    else:  # Grayscale image
+                        # Ensure mask shape matches the image
+                        if masked_image.shape == cropped_mask.shape:
+                            masked_image = masked_image * cropped_mask
+                        else:
+                            # Reshape mask if dimensions don't match
+                            if cropped_mask.ndim == 2 and masked_image.ndim == 2:
+                                # Resize mask to match image dimensions
+                                resized_mask = np.zeros(masked_image.shape, dtype=cropped_mask.dtype)
+                                # Copy the mask data that fits within the image dimensions
+                                h, w = min(masked_image.shape[0], cropped_mask.shape[0]), min(masked_image.shape[1], cropped_mask.shape[1])
+                                resized_mask[:h, :w] = cropped_mask[:h, :w]
+                                masked_image = masked_image * resized_mask
+                    
+                    # Convert back to uint8 for PIL
+                    masked_image = masked_image.astype(np.uint8)
+            
+            # Convert back to PIL Image
+            masked_image = Image.fromarray(masked_image)
         else:
             # If mask is empty, use original image (though this should be rare)
             masked_image = image
@@ -160,20 +189,55 @@ class MultiLayerFeatureKNN:
         Train the KNN classifier with features extracted from masked regions
         
         Args:
-            images: List of images
-            masks: List of masks where masks[i] can be either a single mask or a list of masks for image[i]
+            images: List of images or a single image
+            masks: List of masks or a single mask where masks[i] can be either a single mask 
+                  or a list of masks for image[i]
             labels: List of labels corresponding to each mask (if None, assumes all are positive class)
-                   Should match the structure of masks: if masks[i] is a list, labels[i] should be a list of same length
+                   Should match the structure of masks: if masks[i] is a list, labels[i] should be 
+                   a list of same length
         """
         self.features = []
         self.labels = []
         
+        # Convert single image to list for consistent processing
+        if not isinstance(images, list):
+            images = [images]
+        
+        # Convert single mask to list for consistent processing
+        if not isinstance(masks, list):
+            masks = [masks]
+            
         # Process each image and its corresponding mask(s)
         for i in range(len(images)):
             image = images[i]
             
-            # Handle case where masks[i] is a single mask or a list of masks
-            if isinstance(masks[i], list):
+            # Handle case where we only have one image but multiple masks
+            if len(masks) > len(images) and i == 0:
+                # Assume all masks are for the first image
+                image_masks = masks
+                
+                # Get corresponding labels if provided
+                if labels is not None:
+                    if isinstance(labels, list) and len(labels) == len(masks):
+                        image_labels = labels
+                    else:
+                        # Replicate single label for all masks
+                        image_labels = [1] * len(image_masks)
+                else:
+                    # Default all to positive class
+                    image_labels = [1] * len(image_masks)
+                
+                # Process each mask for this image
+                for j, mask in enumerate(image_masks):
+                    try:
+                        feature = self.extract_features(image, mask)
+                        self.features.append(feature)
+                        self.labels.append(image_labels[j])
+                    except Exception as e:
+                        print(f"Error processing mask {j}: {e}")
+                        continue
+            # Handle case where masks[i] is a list of masks for image[i]
+            elif i < len(masks) and isinstance(masks[i], list):
                 # Multiple masks for this image
                 image_masks = masks[i]
                 
@@ -190,10 +254,14 @@ class MultiLayerFeatureKNN:
                 
                 # Process each mask for this image
                 for j, mask in enumerate(image_masks):
-                    feature = self.extract_features(image, mask)
-                    self.features.append(feature)
-                    self.labels.append(image_labels[j])
-            else:
+                    try:
+                        feature = self.extract_features(image, mask)
+                        self.features.append(feature)
+                        self.labels.append(image_labels[j])
+                    except Exception as e:
+                        print(f"Error processing mask {j}: {e}")
+                        continue
+            elif i < len(masks):
                 # Single mask for this image
                 mask = masks[i]
                 
@@ -204,9 +272,13 @@ class MultiLayerFeatureKNN:
                     label = 1  # Default to positive class
                 
                 # Extract features and store
-                feature = self.extract_features(image, mask)
-                self.features.append(feature)
-                self.labels.append(label)
+                try:
+                    feature = self.extract_features(image, mask)
+                    self.features.append(feature)
+                    self.labels.append(label)
+                except Exception as e:
+                    print(f"Error processing mask for image {i}: {e}")
+                    continue
         
         # Apply PCA for dimensionality reduction
         if len(self.features) > 1:  # Need at least 2 samples for PCA
@@ -216,9 +288,15 @@ class MultiLayerFeatureKNN:
             
             # Train KNN with reduced features
             self.knn.fit(reduced_features, self.labels)
-        else:
+        elif len(self.features) == 1:
             # If only one sample, skip PCA
+            print("Warning: Only one feature extracted. Skipping PCA and using original feature.")
             self.knn.fit(self.features, self.labels)
+        else:
+            print("Error: No features were extracted. Cannot train KNN model.")
+            return False
+        
+        return True
     
     def predict(self, image, candidate_masks, threshold=None, return_scores=True):
         """
@@ -242,9 +320,22 @@ class MultiLayerFeatureKNN:
             
         # Extract features for all candidate masks
         features = []
-        for mask in candidate_masks:
-            feature = self.extract_features(image, mask)
-            features.append(feature)
+        valid_masks = []
+        
+        for i, mask in enumerate(candidate_masks):
+            try:
+                feature = self.extract_features(image, mask)
+                features.append(feature)
+                valid_masks.append(mask)
+            except Exception as e:
+                print(f"Error extracting features for mask {i}: {e}")
+                continue
+        
+        if not features:
+            if return_scores:
+                return [], []
+            else:
+                return []
         
         # Apply PCA transformation if available
         if self.pca is not None:
@@ -260,10 +351,11 @@ class MultiLayerFeatureKNN:
         if threshold is None:
             # Statistical threshold based on distances
             threshold = np.mean(distances) + np.std(distances)
+            print(f'Using statistical threshold: {threshold:4.3}')
         
         # Filter masks based on distance threshold
         filtered_indices = [i for i, d in enumerate(distances) if np.mean(d) <= threshold]
-        filtered_masks = [candidate_masks[i] for i in filtered_indices]
+        filtered_masks = [valid_masks[i] for i in filtered_indices]
         filtered_scores = [similarity_scores[i] for i in filtered_indices]
         
         if return_scores:
