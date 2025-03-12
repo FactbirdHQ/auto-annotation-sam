@@ -27,10 +27,19 @@ def preprocess(data_path: Path, output_folder: Path) -> None:
     dataset = MyDataset(data_path)
     dataset.preprocess(output_folder)
 
-def load_and_crop_data(img_path, label_path, crop_coords):
-    """Load image and YOLO masks, then crop them to specified region"""
-    y_start, y_end, x_start, x_end = crop_coords
+def load_and_crop_data(img_path, label_path, crop_coords=None):
+    """
+    Load image and YOLO masks, then optionally crop them to specified region
     
+    Args:
+        img_path: Path to the input image
+        label_path: Path to the YOLO format label file
+        crop_coords: Optional tuple of (y_start, y_end, x_start, x_end) for cropping.
+                    If None, uses the entire image.
+    
+    Returns:
+        tuple: (image, masks) where image is a numpy array and masks is a list of binary masks
+    """
     # Load full image for original dimensions
     full_img = np.array(Image.open(img_path).convert("RGB"))
     original_h, original_w, _ = full_img.shape
@@ -38,11 +47,24 @@ def load_and_crop_data(img_path, label_path, crop_coords):
     # Generate masks using original dimensions
     masks = load_yolo_masks_as_binary_list(label_path, original_w, original_h)
     
-    # Crop image and masks
-    cropped_img = full_img[y_start:y_end, x_start:x_end]
-    cropped_masks = [mask[y_start:y_end, x_start:x_end] for mask in masks]
-    
-    return cropped_img, cropped_masks
+    # If crop coordinates are provided, crop the image and masks
+    if crop_coords is not None:
+        y_start, y_end, x_start, x_end = crop_coords
+        
+        # Validate crop coordinates
+        y_start = max(0, y_start)
+        y_end = min(original_h, y_end)
+        x_start = max(0, x_start)
+        x_end = min(original_w, x_end)
+        
+        # Crop image and masks
+        cropped_img = full_img[y_start:y_end, x_start:x_end]
+        cropped_masks = [mask[y_start:y_end, x_start:x_end] for mask in masks]
+        
+        return cropped_img, cropped_masks
+    else:
+        # Return the full image and masks without cropping
+        return full_img, masks
 
 
 def load_yolo_masks_as_binary_list(txt_path, img_width, img_height):
