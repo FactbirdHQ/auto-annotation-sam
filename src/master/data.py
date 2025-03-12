@@ -214,5 +214,21 @@ def calculate_iou(mask1: np.ndarray, mask2: np.ndarray) -> float:
     
     return intersection / union
 
+def sort_masks(filtered_masks, filtered_probs):
+    # Create pairs of (mask, score)
+    mask_score_pairs = list(zip(filtered_masks, filtered_probs))
+
+    # Sort the pairs based on scores in descending order (highest score first)
+    sorted_pairs = sorted(mask_score_pairs, key=lambda x: x[1], reverse=True)
+
+    # Unzip the sorted pairs
+    sorted_masks, sorted_probs = zip(*sorted_pairs) if sorted_pairs else ([], [])
+
+    # Convert back to lists if needed
+    sorted_masks = list(sorted_masks)
+    sorted_probs = list(sorted_probs)
+
+    return sorted_masks, sorted_probs
+
 if __name__ == "__main__":
     typer.run(preprocess)

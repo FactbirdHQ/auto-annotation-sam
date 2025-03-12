@@ -362,16 +362,267 @@ class MultiLayerFeatureKNN:
         for hook in self.hooks:
             hook.remove()
 
-if __name__ == "__main__":
+import clip
+import torch.nn.functional as F
 
-    # Initialize with specific layers and PCA variance threshold
-    knn = MultiLayerFeatureKNN(layers=[5, 6, 7], pca_variance=0.95)
+class CLIPFeatureSimilarity:
+    def __init__(self, clip_model="ViT-B/32", similarity_threshold=0.8, device=None):
+        """
+        Initialize a CLIP-based feature extractor for similarity-based auto-labeling
+        
+        Args:
+            clip_model: CLIP model variant to use ("ViT-B/32", "ViT-B/16", etc.)
+            similarity_threshold: Threshold for considering a region as matching the reference
+            device: Device to run inference on (will use CUDA if available by default)
+        """
+        # Set up device
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+            
+        print(f"Using device: {self.device}")
+        
+        # Load the CLIP model
+        self.model, self.preprocess = clip.load(clip_model, device=self.device)
+        
+        # We don't need to train the model
+        self.model.eval()
+        
+        # Set the similarity threshold
+        self.similarity_threshold = similarity_threshold
+        
+        # Store reference embeddings
+        self.reference_embeddings = []
+        self.reference_centroid = None
+        
+        # Define a basic transform to use when we're extracting with masks
+        # This will be used after applying the mask, then we'll apply CLIP's preprocess
+        self.basic_transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+    
+    def extract_features(self, image, mask):
+        """
+        Extract CLIP features from a masked region of an image
+        
+        Args:
+            image: PIL Image or numpy array
+            mask: Binary mask indicating the region of interest (numpy array)
+            
+        Returns:
+            features: Normalized feature vector from CLIP
+        """
+        # Convert image to PIL if it's numpy
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image.astype(np.uint8))
+        
+        # Ensure mask is numpy
+        if not isinstance(mask, np.ndarray):
+            mask = np.array(mask)
+        
+        # Find bounding box of the mask
+        if mask.sum() > 0:  # Only if mask has positive pixels
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            y_min, y_max = np.where(rows)[0][[0, -1]]
+            x_min, x_max = np.where(cols)[0][[0, -1]]
+            
+            # Add padding to ensure the object is fully captured
+            padding = 10
+            y_min = max(0, y_min - padding)
+            y_max = min(mask.shape[0], y_max + padding)
+            x_min = max(0, x_min - padding)
+            x_max = min(mask.shape[1], x_max + padding)
+            
+            # Check if the bounding box is valid
+            if x_max <= x_min or y_max <= y_min:
+                # Invalid bounding box, use the entire image
+                image_array = np.array(image)
+                # Apply mask to the image if dimensions allow
+                if len(image_array.shape) == 3 and image_array.shape[:2] == mask.shape:
+                    mask_3d = np.expand_dims(mask, axis=2).repeat(3, axis=2)
+                    masked_image = image_array * mask_3d
+                else:
+                    # If dimensions don't match, just use the original image
+                    masked_image = image_array
+            else:
+                # Crop the image and mask to the bounding box
+                image_array = np.array(image)
+                
+                # Handle different image formats
+                if len(image_array.shape) == 3:  # RGB image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max, :]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    # Expand mask to match image channels
+                    mask_3d = np.expand_dims(cropped_mask, axis=2).repeat(3, axis=2)
+                    masked_image = cropped_image * mask_3d
+                else:  # Grayscale image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    masked_image = cropped_image * cropped_mask
+                
+                # Check if mask actually removed content - if it's all zeros, use the cropped image
+                if np.sum(masked_image) < 10:  # Arbitrary small threshold
+                    masked_image = cropped_image
+        else:
+            # Empty mask, use original image
+            masked_image = np.array(image)
+        
+        # Convert back to PIL Image
+        masked_image = Image.fromarray(masked_image.astype(np.uint8))
+        
+        # Apply CLIP's preprocessing
+        input_tensor = self.preprocess(masked_image).unsqueeze(0).to(self.device)
+        
+        # Extract features using CLIP
+        with torch.no_grad():
+            features = self.model.encode_image(input_tensor)
+            
+        # Normalize features
+        features = F.normalize(features, dim=-1)
+        
+        return features.cpu().numpy()[0]  # Return as numpy array
+    
+    def fit(self, images, masks):
+        """
+        Extract and store reference features from positive examples
+        
+        Args:
+            images: List of images or a single image
+            masks: List of masks or a single mask
+            
+        Returns:
+            bool: Success or failure
+        """
+        self.reference_embeddings = []
+        
+        # Convert single image to list for consistent processing
+        if not isinstance(images, list):
+            images = [images]
+        
+        # Convert single mask to list for consistent processing
+        if not isinstance(masks, list):
+            masks = [masks]
+        
+        # Process each image and its corresponding mask(s)
+        for i in range(len(images)):
+            image = images[i]
+            
+            # Handle case where we have one image but multiple masks
+            if len(masks) > len(images) and i == 0:
+                image_masks = masks
+                
+                # Process each mask for this image
+                for mask in image_masks:
+                    try:
+                        feature = self.extract_features(image, mask)
+                        self.reference_embeddings.append(feature)
+                    except Exception as e:
+                        print(f"Error processing mask: {e}")
+            # Handle case where masks[i] is a list of masks for image[i]
+            elif i < len(masks) and isinstance(masks[i], list):
+                image_masks = masks[i]
+                
+                # Process each mask for this image
+                for mask in image_masks:
+                    try:
+                        feature = self.extract_features(image, mask)
+                        self.reference_embeddings.append(feature)
+                    except Exception as e:
+                        print(f"Error processing mask: {e}")
+            elif i < len(masks):
+                # Single mask for this image
+                mask = masks[i]
+                
+                # Extract features
+                try:
+                    feature = self.extract_features(image, mask)
+                    self.reference_embeddings.append(feature)
+                except Exception as e:
+                    print(f"Error processing mask: {e}")
+        
+        # Compute centroid of reference embeddings (if any)
+        if self.reference_embeddings:
+            self.reference_embeddings = np.array(self.reference_embeddings)
+            self.reference_centroid = np.mean(self.reference_embeddings, axis=0)
+            self.reference_centroid = self.reference_centroid / np.linalg.norm(self.reference_centroid)
+            print(f"Created reference with {len(self.reference_embeddings)} examples")
+            return True
+        else:
+            print("No valid reference features extracted")
+            return False
+    
+    def predict(self, image, candidate_masks, threshold=None, return_similarities=True):
+        """
+        Predict which candidate masks match the reference features
+        
+        Args:
+            image: Input image
+            candidate_masks: List of candidate segmentation masks
+            threshold: Optional override for the similarity threshold
+            return_similarities: Whether to return similarity scores
+            
+        Returns:
+            filtered_masks: List of masks classified as matching
+            similarities: (Optional) Similarity scores for each filtered mask
+        """
+        if threshold is None:
+            threshold = self.similarity_threshold
+            
+        if not candidate_masks or len(candidate_masks) == 0:
+            if return_similarities:
+                return [], []
+            else:
+                return []
+        
+        # Check if we have reference features
+        if self.reference_centroid is None:
+            print("No reference features available. Call fit() first.")
+            if return_similarities:
+                return [], []
+            else:
+                return []
+        
+        # Extract features for all candidate masks
+        candidate_features = []
+        valid_masks = []
+        
+        for mask in candidate_masks:
+            try:
+                feature = self.extract_features(image, mask)
+                candidate_features.append(feature)
+                valid_masks.append(mask)
+            except Exception as e:
+                print(f"Error extracting features: {e}")
+        
+        if not candidate_features:
+            if return_similarities:
+                return [], []
+            else:
+                return []
+        
+        # Compare each candidate to the reference centroid
+        similarities = []
+        filtered_masks = []
+        
+        for i, feature in enumerate(candidate_features):
+            # Compute cosine similarity
+            similarity = np.dot(feature, self.reference_centroid)
+            
+            # Apply threshold
+            if similarity >= threshold:
+                filtered_masks.append(valid_masks[i])
+                similarities.append(float(similarity))  # Convert to Python float for JSON serialization
+        
+        # Sort by similarity (highest first)
+        if filtered_masks:
+            sorted_indices = np.argsort(similarities)[::-1]
+            filtered_masks = [filtered_masks[i] for i in sorted_indices]
+            similarities = [similarities[i] for i in sorted_indices]
+        
+        if return_similarities:
+            return filtered_masks, similarities
+        else:
+            return filtered_masks
 
-    # Train with just positive examples (no need for labels)
-    knn.fit(positive_images, positive_masks)
-
-    # Predict returns masks that are similar to training examples
-    filtered_masks, similarity_scores = knn.predict(test_image, candidate_masks)
-
-    # Always call cleanup when done to prevent memory leaks
-    knn.cleanup()
