@@ -626,3 +626,1278 @@ class CLIPFeatureSimilarity:
         else:
             return filtered_masks
 
+
+
+import clip
+import torch
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+class CLIPClassifier:
+    def __init__(self, clip_model="ViT-B/32", device=None):
+        """
+        Initialize a CLIP-based classifier that uses logistic regression on CLIP embeddings
+        
+        Args:
+            clip_model: CLIP model variant to use ("ViT-B/32", "ViT-B/16", etc.)
+            device: Device to run inference on (will use CUDA if available by default)
+        """
+        # Set up device
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+            
+        print(f"Using device: {self.device}")
+        
+        # Load the CLIP model
+        self.model, self.preprocess = clip.load(clip_model, device=self.device)
+        
+        # We don't need to train the CLIP model
+        self.model.eval()
+        
+        # Define a basic transform to use when we're extracting with masks
+        self.basic_transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        
+        # Initialize logistic regression classifier
+        self.classifier = LogisticRegression(C=1.0, class_weight='balanced', max_iter=1000)
+        
+        # Initialize scaler for feature normalization
+        self.scaler = StandardScaler()
+        
+        # Flag to track if the model has been trained
+        self.is_trained = False
+    
+    def extract_features(self, image, mask):
+        """
+        Extract CLIP features from a masked region of an image
+        
+        Args:
+            image: PIL Image or numpy array
+            mask: Binary mask indicating the region of interest (numpy array)
+            
+        Returns:
+            features: Normalized feature vector from CLIP
+        """
+        # Convert image to PIL if it's numpy
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image.astype(np.uint8))
+        
+        # Ensure mask is numpy
+        if not isinstance(mask, np.ndarray):
+            mask = np.array(mask)
+        
+        # Find bounding box of the mask
+        if mask.sum() > 0:  # Only if mask has positive pixels
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            y_min, y_max = np.where(rows)[0][[0, -1]]
+            x_min, x_max = np.where(cols)[0][[0, -1]]
+            
+            # Add padding to ensure the object is fully captured
+            padding = 10
+            y_min = max(0, y_min - padding)
+            y_max = min(mask.shape[0], y_max + padding)
+            x_min = max(0, x_min - padding)
+            x_max = min(mask.shape[1], x_max + padding)
+            
+            # Check if the bounding box is valid
+            if x_max <= x_min or y_max <= y_min:
+                # Invalid bounding box, use the entire image
+                image_array = np.array(image)
+                # Apply mask to the image if dimensions allow
+                if len(image_array.shape) == 3 and image_array.shape[:2] == mask.shape:
+                    mask_3d = np.expand_dims(mask, axis=2).repeat(3, axis=2)
+                    masked_image = image_array * mask_3d
+                else:
+                    # If dimensions don't match, just use the original image
+                    masked_image = image_array
+            else:
+                # Crop the image and mask to the bounding box
+                image_array = np.array(image)
+                
+                # Handle different image formats
+                if len(image_array.shape) == 3:  # RGB image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max, :]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    # Expand mask to match image channels
+                    mask_3d = np.expand_dims(cropped_mask, axis=2).repeat(3, axis=2)
+                    masked_image = cropped_image * mask_3d
+                else:  # Grayscale image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    masked_image = cropped_image * cropped_mask
+                
+                # Check if mask actually removed content - if it's all zeros, use the cropped image
+                if np.sum(masked_image) < 10:  # Arbitrary small threshold
+                    masked_image = cropped_image
+        else:
+            # Empty mask, use original image
+            masked_image = np.array(image)
+        
+        # Convert back to PIL Image
+        masked_image = Image.fromarray(masked_image.astype(np.uint8))
+        
+        # Apply CLIP's preprocessing
+        input_tensor = self.preprocess(masked_image).unsqueeze(0).to(self.device)
+        
+        # Extract features using CLIP
+        with torch.no_grad():
+            features = self.model.encode_image(input_tensor)
+            
+        # Return as numpy array
+        return features.cpu().numpy()[0]
+    
+    def fit(self, images, masks, labels):
+        """
+        Extract features from images and train logistic regression classifier
+        
+        Args:
+            images: List of images or a single image
+            masks: List where each element contains multiple masks for the corresponding image,
+                  or a flat list of masks if only one image is provided
+            labels: List where each element contains multiple binary labels corresponding to 
+                  the masks for each image, or a flat list of labels if only one image is provided
+            
+        Returns:
+            bool: Success or failure
+        """
+        # Process to collect features
+        features = []
+        target_labels = []
+        
+        # Convert single image to list for consistent processing
+        if not isinstance(images, list):
+            images = [images]
+            
+        # Handle case of a single image with many masks (flat structure)
+        if len(images) == 1 and len(masks) > 1 and not isinstance(masks[0], list):
+            # If we have a single image but a flat list of masks
+            # We'll restructure to our expected nested format
+            masks = [masks]
+            labels = [labels]
+            
+        # Check data structure
+        if len(images) != len(masks):
+            print(f"Error: Number of images ({len(images)}) does not match number of mask lists ({len(masks)})")
+            print("Note: If providing a single image with multiple masks, ensure masks is a list of masks and labels is a matching list of labels")
+            return False
+            
+        if len(images) != len(labels):
+            print(f"Error: Number of images ({len(images)}) does not match number of label lists ({len(labels)})")
+            return False
+        
+        # Process each image with its corresponding masks and labels
+        for i in range(len(images)):
+            image = images[i]
+            image_masks = masks[i]
+            image_labels = labels[i]
+            
+            # Ensure masks is a list of masks
+            if not isinstance(image_masks, list):
+                image_masks = [image_masks]
+                
+            # Ensure labels is a list of labels
+            if not isinstance(image_labels, list):
+                image_labels = [image_labels]
+                
+            # Check if masks and labels have the same length
+            if len(image_masks) != len(image_labels):
+                print(f"Warning: Number of masks ({len(image_masks)}) does not match number of labels ({len(image_labels)}) for image {i}")
+                # Use the shorter length
+                min_len = min(len(image_masks), len(image_labels))
+                image_masks = image_masks[:min_len]
+                image_labels = image_labels[:min_len]
+                
+            # Process each mask and label for this image
+            for j, (mask, label) in enumerate(zip(image_masks, image_labels)):
+                try:
+                    feature = self.extract_features(image, mask)
+                    features.append(feature)
+                    target_labels.append(label)
+                except Exception as e:
+                    print(f"Error processing mask {j} for image {i}: {e}")
+        
+        # Check if we extracted any features
+        if not features:
+            print("No valid features extracted")
+            return False
+            
+        # Convert features and labels to numpy arrays
+        features = np.array(features)
+        target_labels = np.array(target_labels)
+        
+        # Normalize features with StandardScaler
+        self.scaler.fit(features)
+        normalized_features = self.scaler.transform(features)
+        
+        # Train logistic regression model
+        self.classifier.fit(normalized_features, target_labels)
+        self.is_trained = True
+        
+        print(f"Trained classifier with {len(features)} examples")
+        return True
+    
+    def predict(self, image, candidate_masks, return_probabilities=True, return_all=False):
+        """
+        Predict class labels for candidate masks
+        
+        Args:
+            image: Input image
+            candidate_masks: List of candidate segmentation masks
+            return_probabilities: Whether to return probability scores
+            return_all: If True, return all masks with their predictions and probabilities
+                       If False (default), only return masks predicted as positive
+            
+        Returns:
+            If return_all=False:
+                filtered_masks: List of masks classified as positive
+                probabilities: (Optional) Probability scores for positive class
+            If return_all=True:
+                all_masks: List of all valid masks
+                predictions: List of binary predictions (0 or 1)
+                probabilities: (Optional) List of probability scores for positive class
+        """
+        if not self.is_trained:
+            print("Model not trained. Call fit() first.")
+            if return_all:
+                if return_probabilities:
+                    return [], [], []
+                else:
+                    return [], []
+            else:
+                if return_probabilities:
+                    return [], []
+                else:
+                    return []
+            
+        if not candidate_masks or len(candidate_masks) == 0:
+            if return_all:
+                if return_probabilities:
+                    return [], [], []
+                else:
+                    return [], []
+            else:
+                if return_probabilities:
+                    return [], []
+                else:
+                    return []
+        
+        # Extract features for all candidate masks
+        candidate_features = []
+        valid_masks = []
+        
+        for i, mask in enumerate(candidate_masks):
+            try:
+                feature = self.extract_features(image, mask)
+                candidate_features.append(feature)
+                valid_masks.append(mask)
+            except Exception as e:
+                print(f"Error extracting features for mask {i}: {e}")
+        
+        if not candidate_features:
+            if return_all:
+                if return_probabilities:
+                    return [], [], []
+                else:
+                    return [], []
+            else:
+                if return_probabilities:
+                    return [], []
+                else:
+                    return []
+        
+        # Normalize features
+        normalized_features = self.scaler.transform(candidate_features)
+        
+        # Get predictions
+        predictions = self.classifier.predict(normalized_features)
+        
+        # Get probabilities if requested
+        if return_probabilities:
+            probabilities = self.classifier.predict_proba(normalized_features)
+            # Get probability for positive class (index 1)
+            if probabilities.shape[1] > 1:
+                positive_probs = probabilities[:, 1]  # Binary classification
+            else:
+                positive_probs = probabilities[:, 0]  # Single class
+            
+            # Convert to Python floats for JSON serialization
+            positive_probs = [float(p) for p in positive_probs]
+        
+        if return_all:
+            # Return all masks with their predictions
+            pred_list = [int(p) for p in predictions]  # Convert to Python ints
+            if return_probabilities:
+                return valid_masks, pred_list, positive_probs
+            else:
+                return valid_masks, pred_list
+        else:
+            # Filter positive predictions
+            filtered_masks = []
+            filtered_probs = []
+            
+            for i, pred in enumerate(predictions):
+                if pred == 1:  # Positive class
+                    filtered_masks.append(valid_masks[i])
+                    if return_probabilities:
+                        filtered_probs.append(positive_probs[i])
+            
+            # Sort by probability (highest first)
+            if filtered_masks and return_probabilities:
+                sorted_indices = np.argsort(filtered_probs)[::-1]
+                filtered_masks = [filtered_masks[i] for i in sorted_indices]
+                filtered_probs = [filtered_probs[i] for i in sorted_indices]
+            
+            if return_probabilities:
+                return filtered_masks, filtered_probs
+            else:
+                return filtered_masks
+        
+
+import clip
+import torch
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+
+class CLIPGradientBoostClassifier:
+    def __init__(self, clip_model="ViT-B/32", device=None, n_estimators=100, learning_rate=0.1, max_depth=3):
+        """
+        Initialize a CLIP-based classifier that uses Gradient Boosting on CLIP embeddings
+        
+        Args:
+            clip_model: CLIP model variant to use ("ViT-B/32", "ViT-B/16", etc.)
+            device: Device to run inference on (will use CUDA if available by default)
+            n_estimators: Number of boosting stages to use
+            learning_rate: Learning rate shrinks the contribution of each tree
+            max_depth: Maximum depth of the individual regression estimators
+        """
+        # Set up device
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+            
+        print(f"Using device: {self.device}")
+        
+        # Load the CLIP model
+        self.model, self.preprocess = clip.load(clip_model, device=self.device)
+        
+        # We don't need to train the CLIP model
+        self.model.eval()
+        
+        # Define a basic transform to use when we're extracting with masks
+        self.basic_transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        
+        # Initialize Gradient Boosting classifier
+        self.classifier = GradientBoostingClassifier(
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=max_depth,
+            subsample=0.8,  # Use 80% of samples for building trees
+            random_state=42
+        )
+        
+        # Initialize scaler for feature normalization
+        self.scaler = StandardScaler()
+        
+        # Flag to track if the model has been trained
+        self.is_trained = False
+    
+    def extract_features(self, image, mask):
+        """
+        Extract CLIP features from a masked region of an image
+        
+        Args:
+            image: PIL Image or numpy array
+            mask: Binary mask indicating the region of interest (numpy array)
+            
+        Returns:
+            features: Normalized feature vector from CLIP
+        """
+        # Convert image to PIL if it's numpy
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image.astype(np.uint8))
+        
+        # Ensure mask is numpy
+        if not isinstance(mask, np.ndarray):
+            mask = np.array(mask)
+        
+        # Find bounding box of the mask
+        if mask.sum() > 0:  # Only if mask has positive pixels
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            y_min, y_max = np.where(rows)[0][[0, -1]]
+            x_min, x_max = np.where(cols)[0][[0, -1]]
+            
+            # Add padding to ensure the object is fully captured
+            padding = 10
+            y_min = max(0, y_min - padding)
+            y_max = min(mask.shape[0], y_max + padding)
+            x_min = max(0, x_min - padding)
+            x_max = min(mask.shape[1], x_max + padding)
+            
+            # Check if the bounding box is valid
+            if x_max <= x_min or y_max <= y_min:
+                # Invalid bounding box, use the entire image
+                image_array = np.array(image)
+                # Apply mask to the image if dimensions allow
+                if len(image_array.shape) == 3 and image_array.shape[:2] == mask.shape:
+                    mask_3d = np.expand_dims(mask, axis=2).repeat(3, axis=2)
+                    masked_image = image_array * mask_3d
+                else:
+                    # If dimensions don't match, just use the original image
+                    masked_image = image_array
+            else:
+                # Crop the image and mask to the bounding box
+                image_array = np.array(image)
+                
+                # Handle different image formats
+                if len(image_array.shape) == 3:  # RGB image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max, :]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    # Expand mask to match image channels
+                    mask_3d = np.expand_dims(cropped_mask, axis=2).repeat(3, axis=2)
+                    masked_image = cropped_image * mask_3d
+                else:  # Grayscale image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    masked_image = cropped_image * cropped_mask
+                
+                # Check if mask actually removed content - if it's all zeros, use the cropped image
+                if np.sum(masked_image) < 10:  # Arbitrary small threshold
+                    masked_image = cropped_image
+        else:
+            # Empty mask, use original image
+            masked_image = np.array(image)
+        
+        # Convert back to PIL Image
+        masked_image = Image.fromarray(masked_image.astype(np.uint8))
+        
+        # Apply CLIP's preprocessing
+        input_tensor = self.preprocess(masked_image).unsqueeze(0).to(self.device)
+        
+        # Extract features using CLIP
+        with torch.no_grad():
+            features = self.model.encode_image(input_tensor)
+            
+        # Return as numpy array
+        return features.cpu().numpy()[0]
+    
+    def fit(self, images, masks, labels):
+        """
+        Extract features from images and train Gradient Boosting classifier
+        
+        Args:
+            images: List of images or a single image
+            masks: List where each element contains multiple masks for the corresponding image,
+                  or a flat list of masks if only one image is provided
+            labels: List where each element contains multiple binary labels corresponding to 
+                  the masks for each image, or a flat list of labels if only one image is provided
+            
+        Returns:
+            bool: Success or failure
+        """
+        # Process to collect features
+        features = []
+        target_labels = []
+        
+        # Convert single image to list for consistent processing
+        if not isinstance(images, list):
+            images = [images]
+            
+        # Handle case of a single image with many masks (flat structure)
+        if len(images) == 1 and len(masks) > 1 and not isinstance(masks[0], list):
+            # If we have a single image but a flat list of masks
+            # We'll restructure to our expected nested format
+            masks = [masks]
+            labels = [labels]
+            
+        # Check data structure
+        if len(images) != len(masks):
+            print(f"Error: Number of images ({len(images)}) does not match number of mask lists ({len(masks)})")
+            print("Note: If providing a single image with multiple masks, ensure masks is a list of masks and labels is a matching list of labels")
+            return False
+            
+        if len(images) != len(labels):
+            print(f"Error: Number of images ({len(images)}) does not match number of label lists ({len(labels)})")
+            return False
+        
+        # Process each image with its corresponding masks and labels
+        for i in range(len(images)):
+            image = images[i]
+            image_masks = masks[i]
+            image_labels = labels[i]
+            
+            # Ensure masks is a list of masks
+            if not isinstance(image_masks, list):
+                image_masks = [image_masks]
+                
+            # Ensure labels is a list of labels
+            if not isinstance(image_labels, list):
+                image_labels = [image_labels]
+                
+            # Check if masks and labels have the same length
+            if len(image_masks) != len(image_labels):
+                print(f"Warning: Number of masks ({len(image_masks)}) does not match number of labels ({len(image_labels)}) for image {i}")
+                # Use the shorter length
+                min_len = min(len(image_masks), len(image_labels))
+                image_masks = image_masks[:min_len]
+                image_labels = image_labels[:min_len]
+                
+            # Process each mask and label for this image
+            for j, (mask, label) in enumerate(zip(image_masks, image_labels)):
+                try:
+                    feature = self.extract_features(image, mask)
+                    features.append(feature)
+                    target_labels.append(label)
+                except Exception as e:
+                    print(f"Error processing mask {j} for image {i}: {e}")
+        
+        # Check if we extracted any features
+        if not features:
+            print("No valid features extracted")
+            return False
+            
+        # Convert features and labels to numpy arrays
+        features = np.array(features)
+        target_labels = np.array(target_labels)
+        
+        # Normalize features with StandardScaler
+        self.scaler.fit(features)
+        normalized_features = self.scaler.transform(features)
+        
+        # Train Gradient Boosting model
+        self.classifier.fit(normalized_features, target_labels)
+        self.is_trained = True
+        
+        # Calculate feature importance
+        feature_importances = self.classifier.feature_importances_
+        top_indices = np.argsort(feature_importances)[-10:]  # Top 10 features
+        print("Top 10 important feature indices:", top_indices)
+        print("Their importance values:", feature_importances[top_indices])
+        
+        print(f"Trained classifier with {len(features)} examples")
+        return True
+    
+    def predict(self, image, candidate_masks, return_probabilities=True, return_all=False):
+        """
+        Predict class labels for candidate masks
+        
+        Args:
+            image: Input image
+            candidate_masks: List of candidate segmentation masks
+            return_probabilities: Whether to return probability scores
+            return_all: If True, return all masks with their predictions and probabilities
+                       If False (default), only return masks predicted as positive
+            
+        Returns:
+            If return_all=False:
+                filtered_masks: List of masks classified as positive
+                probabilities: (Optional) Probability scores for positive class
+            If return_all=True:
+                all_masks: List of all valid masks
+                predictions: List of binary predictions (0 or 1)
+                probabilities: (Optional) List of probability scores for positive class
+        """
+        if not self.is_trained:
+            print("Model not trained. Call fit() first.")
+            if return_all:
+                if return_probabilities:
+                    return [], [], []
+                else:
+                    return [], []
+            else:
+                if return_probabilities:
+                    return [], []
+                else:
+                    return []
+            
+        if not candidate_masks or len(candidate_masks) == 0:
+            if return_all:
+                if return_probabilities:
+                    return [], [], []
+                else:
+                    return [], []
+            else:
+                if return_probabilities:
+                    return [], []
+                else:
+                    return []
+        
+        # Extract features for all candidate masks
+        candidate_features = []
+        valid_masks = []
+        
+        for i, mask in enumerate(candidate_masks):
+            try:
+                feature = self.extract_features(image, mask)
+                candidate_features.append(feature)
+                valid_masks.append(mask)
+            except Exception as e:
+                print(f"Error extracting features for mask {i}: {e}")
+        
+        if not candidate_features:
+            if return_all:
+                if return_probabilities:
+                    return [], [], []
+                else:
+                    return [], []
+            else:
+                if return_probabilities:
+                    return [], []
+                else:
+                    return []
+        
+        # Normalize features
+        normalized_features = self.scaler.transform(candidate_features)
+        
+        # Get predictions
+        predictions = self.classifier.predict(normalized_features)
+        
+        # Get probabilities if requested
+        if return_probabilities:
+            probabilities = self.classifier.predict_proba(normalized_features)
+            # Get probability for positive class (index 1)
+            if probabilities.shape[1] > 1:
+                positive_probs = probabilities[:, 1]  # Binary classification
+            else:
+                positive_probs = probabilities[:, 0]  # Single class
+            
+            # Convert to Python floats for JSON serialization
+            positive_probs = [float(p) for p in positive_probs]
+        
+        if return_all:
+            # Return all masks with their predictions
+            pred_list = [int(p) for p in predictions]  # Convert to Python ints
+            if return_probabilities:
+                return valid_masks, pred_list, positive_probs
+            else:
+                return valid_masks, pred_list
+        else:
+            # Filter positive predictions
+            filtered_masks = []
+            filtered_probs = []
+            
+            for i, pred in enumerate(predictions):
+                if pred == 1:  # Positive class
+                    filtered_masks.append(valid_masks[i])
+                    if return_probabilities:
+                        filtered_probs.append(positive_probs[i])
+            
+            # Sort by probability (highest first)
+            if filtered_masks and return_probabilities:
+                sorted_indices = np.argsort(filtered_probs)[::-1]
+                filtered_masks = [filtered_masks[i] for i in sorted_indices]
+                filtered_probs = [filtered_probs[i] for i in sorted_indices]
+            
+            if return_probabilities:
+                return filtered_masks, filtered_probs
+            else:
+                return filtered_masks
+    
+            
+    def feature_importance(self, top_n=20):
+        """
+        Return the most important features from the Gradient Boosting model
+        
+        Args:
+            top_n: Number of top features to return
+            
+        Returns:
+            List of (index, importance) tuples for the top features
+        """
+        if not self.is_trained:
+            print("Model not trained. Call fit() first.")
+            return []
+            
+        # Get feature importances
+        importances = self.classifier.feature_importances_
+        
+        # Sort by importance
+        indices = np.argsort(importances)[::-1]
+        
+        # Return top N
+        top_features = [(int(idx), float(importances[idx])) for idx in indices[:top_n]]
+        
+        return top_features
+    
+
+import clip
+import torch
+import torch.nn.functional as F
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+from sklearn.preprocessing import StandardScaler
+import pymc as pm
+import arviz as az
+import pytensor.tensor as pt
+import xarray as xr
+
+class BayesianCLIPClassifier:
+    def __init__(self, clip_model="ViT-B/32", device=None):
+        """
+        Initialize a CLIP-based classifier that uses Bayesian Logistic Regression on CLIP embeddings
+        
+        Args:
+            clip_model: CLIP model variant to use ("ViT-B/32", "ViT-B/16", etc.)
+            device: Device to run inference on (will use CUDA if available by default)
+        """
+        # Set up device
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+            
+        print(f"Using device: {self.device}")
+        
+        # Load the CLIP model
+        self.model, self.preprocess = clip.load(clip_model, device=self.device)
+        
+        # We don't need to train the CLIP model
+        self.model.eval()
+        
+        # Define a basic transform to use when we're extracting with masks
+        self.basic_transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        
+        # Initialize scaler for feature normalization
+        self.scaler = StandardScaler()
+        
+        # Flag to track if the model has been trained
+        self.is_trained = False
+        
+        # Store Bayesian model parameters
+        self.trace = None
+        self.feature_dim = None
+        
+        # MCMC settings
+        self.num_samples = 1000
+        self.tune = 1000
+        self.chains = 2
+        self.target_accept = 0.95  # Higher value for more stable NUTS sampling
+        self.cores = 1  # Set higher if you have more CPU cores
+    
+    def extract_features(self, image, mask):
+        """
+        Extract CLIP features from a masked region of an image
+        
+        Args:
+            image: PIL Image or numpy array
+            mask: Binary mask indicating the region of interest (numpy array)
+            
+        Returns:
+            features: Normalized feature vector from CLIP
+        """
+        # Convert image to PIL if it's numpy
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image.astype(np.uint8))
+        
+        # Ensure mask is numpy
+        if not isinstance(mask, np.ndarray):
+            mask = np.array(mask)
+        
+        # Find bounding box of the mask
+        if mask.sum() > 0:  # Only if mask has positive pixels
+            rows = np.any(mask, axis=1)
+            cols = np.any(mask, axis=0)
+            y_min, y_max = np.where(rows)[0][[0, -1]]
+            x_min, x_max = np.where(cols)[0][[0, -1]]
+            
+            # Add padding to ensure the object is fully captured
+            padding = 10
+            y_min = max(0, y_min - padding)
+            y_max = min(mask.shape[0], y_max + padding)
+            x_min = max(0, x_min - padding)
+            x_max = min(mask.shape[1], x_max + padding)
+            
+            # Check if the bounding box is valid
+            if x_max <= x_min or y_max <= y_min:
+                # Invalid bounding box, use the entire image
+                image_array = np.array(image)
+                # Apply mask to the image if dimensions allow
+                if len(image_array.shape) == 3 and image_array.shape[:2] == mask.shape:
+                    mask_3d = np.expand_dims(mask, axis=2).repeat(3, axis=2)
+                    masked_image = image_array * mask_3d
+                else:
+                    # If dimensions don't match, just use the original image
+                    masked_image = image_array
+            else:
+                # Crop the image and mask to the bounding box
+                image_array = np.array(image)
+                
+                # Handle different image formats
+                if len(image_array.shape) == 3:  # RGB image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max, :]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    # Expand mask to match image channels
+                    mask_3d = np.expand_dims(cropped_mask, axis=2).repeat(3, axis=2)
+                    masked_image = cropped_image * mask_3d
+                else:  # Grayscale image
+                    cropped_image = image_array[y_min:y_max, x_min:x_max]
+                    cropped_mask = mask[y_min:y_max, x_min:x_max]
+                    masked_image = cropped_image * cropped_mask
+                
+                # Check if mask actually removed content - if it's all zeros, use the cropped image
+                if np.sum(masked_image) < 10:  # Arbitrary small threshold
+                    masked_image = cropped_image
+        else:
+            # Empty mask, use original image
+            masked_image = np.array(image)
+        
+        # Convert back to PIL Image
+        masked_image = Image.fromarray(masked_image.astype(np.uint8))
+        
+        # Apply CLIP's preprocessing
+        input_tensor = self.preprocess(masked_image).unsqueeze(0).to(self.device)
+        
+        # Extract features using CLIP
+        with torch.no_grad():
+            features = self.model.encode_image(input_tensor)
+            
+        # Return as numpy array
+        return features.cpu().numpy()[0]
+    
+    def _create_bayesian_model(self, X, y):
+        """
+        Create a Bayesian logistic regression model using PyMC
+        
+        Args:
+            X: Feature matrix
+            y: Target binary labels
+        
+        Returns:
+            PyMC model
+        """
+        num_features = X.shape[1]
+        
+        # Define prior scales based on the data dimension
+        # For high-dimensional data like CLIP embeddings, use regularizing priors
+        # to prevent overfitting
+        weight_scale = 1.0 / np.sqrt(num_features)  # Scale with feature dimension
+        
+        with pm.Model() as model:
+            # Intercept with weakly informative prior
+            alpha = pm.Normal("alpha", mu=0, sigma=1.0)
+            
+            # Coefficient vector with regularizing prior (similar to L2 regularization)
+            beta = pm.Normal("beta", mu=0, sigma=weight_scale, shape=num_features)
+            
+            # Expected value from linear predictor
+            mu = alpha + pm.math.dot(X, beta)
+            
+            # Likelihood (sampling distribution) of observations
+            y_obs = pm.Bernoulli("y_obs", logit_p=mu, observed=y)
+            
+            # Add potential for better sampling
+            # This can improve convergence for difficult problems
+            pm.Potential("prior_potential", -0.5 * pm.math.sum(beta**2) / weight_scale**2)
+        
+        return model
+    
+    def fit(self, images, masks, labels):
+        """
+        Extract features from images and train Bayesian logistic regression model
+        
+        Args:
+            images: List of images or a single image
+            masks: List where each element contains multiple masks for the corresponding image,
+                  or a flat list of masks if only one image is provided
+            labels: List where each element contains multiple binary labels corresponding to 
+                  the masks for each image, or a flat list of labels if only one image is provided
+            
+        Returns:
+            bool: Success or failure
+        """
+        # Process to collect features
+        features = []
+        target_labels = []
+        
+        # Convert single image to list for consistent processing
+        if not isinstance(images, list):
+            images = [images]
+            
+        # Handle case of a single image with many masks (flat structure)
+        if len(images) == 1 and len(masks) > 1 and not isinstance(masks[0], list):
+            # If we have a single image but a flat list of masks
+            # We'll restructure to our expected nested format
+            masks = [masks]
+            labels = [labels]
+            
+        # Check data structure
+        if len(images) != len(masks):
+            print(f"Error: Number of images ({len(images)}) does not match number of mask lists ({len(masks)})")
+            print("Note: If providing a single image with multiple masks, ensure masks is a list of masks and labels is a matching list of labels")
+            return False
+            
+        if len(images) != len(labels):
+            print(f"Error: Number of images ({len(images)}) does not match number of label lists ({len(labels)})")
+            return False
+        
+        # Process each image with its corresponding masks and labels
+        for i in range(len(images)):
+            image = images[i]
+            image_masks = masks[i]
+            image_labels = labels[i]
+            
+            # Ensure masks is a list of masks
+            if not isinstance(image_masks, list):
+                image_masks = [image_masks]
+                
+            # Ensure labels is a list of labels
+            if not isinstance(image_labels, list):
+                image_labels = [image_labels]
+                
+            # Check if masks and labels have the same length
+            if len(image_masks) != len(image_labels):
+                print(f"Warning: Number of masks ({len(image_masks)}) does not match number of labels ({len(image_labels)}) for image {i}")
+                # Use the shorter length
+                min_len = min(len(image_masks), len(image_labels))
+                image_masks = image_masks[:min_len]
+                image_labels = image_labels[:min_len]
+                
+            # Process each mask and label for this image
+            for j, (mask, label) in enumerate(zip(image_masks, image_labels)):
+                try:
+                    feature = self.extract_features(image, mask)
+                    features.append(feature)
+                    target_labels.append(label)
+                except Exception as e:
+                    print(f"Error processing mask {j} for image {i}: {e}")
+        
+        # Check if we extracted any features
+        if not features:
+            print("No valid features extracted")
+            return False
+            
+        # Convert features and labels to numpy arrays
+        features = np.array(features)
+        target_labels = np.array(target_labels)
+        
+        # Store feature dimension for prediction
+        self.feature_dim = features.shape[1]
+        
+        # Normalize features with StandardScaler
+        self.scaler.fit(features)
+        normalized_features = self.scaler.transform(features)
+        
+        # Create and train Bayesian model
+        print(f"Creating Bayesian model with {len(features)} examples, {features.shape[1]} features")
+        print(f"Class balance: {np.sum(target_labels)} positive out of {len(target_labels)} ({np.mean(target_labels)*100:.1f}%)")
+        
+        # Check if we have enough data and good class balance
+        if len(target_labels) < 10:
+            print("Warning: Very small dataset. Bayesian inference may be unstable.")
+        
+        if np.mean(target_labels) < 0.05 or np.mean(target_labels) > 0.95:
+            print("Warning: Highly imbalanced dataset. Consider using class weights or augmentation.")
+        
+        # Create Bayesian model
+        with self._create_bayesian_model(normalized_features, target_labels) as model:
+            try:
+                # Use NUTS sampler with auto-tuning
+                self.trace = pm.sample(
+                    draws=self.num_samples,
+                    tune=self.tune,
+                    chains=self.chains,
+                    cores=self.cores,
+                    target_accept=self.target_accept,
+                    return_inferencedata=True
+                )
+                print("Bayesian model training successful")
+                
+                # Get posterior statistics for diagnostics
+                summary = az.summary(self.trace, var_names=["alpha", "beta"])
+                print("Posterior Summary:\n", summary.head())
+                
+                # Check for sampling issues
+                warnings = 0
+                if np.any(summary["r_hat"] > 1.1):
+                    print("Warning: Some parameters have r_hat > 1.1, indicating potential convergence issues")
+                    warnings += 1
+                    
+                if warnings == 0:
+                    print("All convergence diagnostics look good!")
+                    
+                self.is_trained = True
+                return True
+                
+            except Exception as e:
+                print(f"Error during Bayesian model training: {e}")
+                return False
+    
+    def _predict_proba_from_trace(self, X):
+        """
+        Get predicted probabilities for each sample by averaging over posterior draws
+        
+        Args:
+            X: Feature matrix
+            
+        Returns:
+            Probability estimates for positive class
+        """
+        # Extract posterior samples
+        alpha_samples = self.trace.posterior.alpha.values.flatten()
+        beta_samples = self.trace.posterior.beta.values.reshape(-1, self.feature_dim)
+        
+        # Number of posterior samples
+        n_samples = len(alpha_samples)
+        
+        # Number of data points
+        n_data = X.shape[0]
+        
+        # Initialize predictions array
+        all_preds = np.zeros((n_samples, n_data))
+        
+        # For each posterior sample, compute probabilities
+        for i in range(n_samples):
+            # Linear predictor
+            logits = alpha_samples[i] + X @ beta_samples[i]
+            
+            # Apply sigmoid to get probabilities
+            probs = 1 / (1 + np.exp(-logits))
+            
+            all_preds[i] = probs
+        
+        # Mean probability across all posterior samples
+        mean_probs = np.mean(all_preds, axis=0)
+        
+        # Get standard deviation for uncertainty quantification
+        std_probs = np.std(all_preds, axis=0)
+        
+        return mean_probs, std_probs
+    
+    def predict(self, image, candidate_masks, return_probabilities=True, return_uncertainty=False, return_all=False):
+        """
+        Predict class labels for candidate masks
+        
+        Args:
+            image: Input image
+            candidate_masks: List of candidate segmentation masks
+            return_probabilities: Whether to return probability scores
+            return_uncertainty: Whether to return uncertainty estimates
+            return_all: If True, return all masks with their predictions and probabilities
+                       If False (default), only return masks predicted as positive
+            
+        Returns:
+            If return_all=False:
+                filtered_masks: List of masks classified as positive
+                probabilities: (Optional) Probability scores for positive class
+                uncertainties: (Optional) Uncertainty estimates for predictions
+            If return_all=True:
+                all_masks: List of all valid masks
+                predictions: List of binary predictions (0 or 1)
+                probabilities: (Optional) List of probability scores for positive class
+                uncertainties: (Optional) List of uncertainty estimates
+        """
+        if not self.is_trained or self.trace is None:
+            print("Model not trained. Call fit() first.")
+            if return_all:
+                result = [[], []]  # masks, predictions
+                if return_probabilities:
+                    result.append([])  # probabilities
+                if return_uncertainty:
+                    result.append([])  # uncertainties
+                return tuple(result)
+            else:
+                result = []  # masks
+                if return_probabilities:
+                    result.append([])  # probabilities
+                if return_uncertainty:
+                    result.append([])  # uncertainties
+                return tuple(result)
+            
+        if not candidate_masks or len(candidate_masks) == 0:
+            if return_all:
+                result = [[], []]  # masks, predictions
+                if return_probabilities:
+                    result.append([])  # probabilities
+                if return_uncertainty:
+                    result.append([])  # uncertainties
+                return tuple(result)
+            else:
+                result = []  # masks
+                if return_probabilities:
+                    result.append([])  # probabilities
+                if return_uncertainty:
+                    result.append([])  # uncertainties
+                return tuple(result)
+        
+        # Extract features for all candidate masks
+        candidate_features = []
+        valid_masks = []
+        
+        for i, mask in enumerate(candidate_masks):
+            try:
+                feature = self.extract_features(image, mask)
+                candidate_features.append(feature)
+                valid_masks.append(mask)
+            except Exception as e:
+                print(f"Error extracting features for mask {i}: {e}")
+        
+        if not candidate_features:
+            if return_all:
+                result = [[], []]  # masks, predictions
+                if return_probabilities:
+                    result.append([])  # probabilities
+                if return_uncertainty:
+                    result.append([])  # uncertainties
+                return tuple(result)
+            else:
+                result = []  # masks
+                if return_probabilities:
+                    result.append([])  # probabilities
+                if return_uncertainty:
+                    result.append([])  # uncertainties
+                return tuple(result)
+        
+        # Normalize features
+        normalized_features = self.scaler.transform(candidate_features)
+        
+        # Get predicted probabilities and uncertainties
+        probs, uncertainties = self._predict_proba_from_trace(normalized_features)
+        
+        # Convert to binary predictions
+        predictions = (probs >= 0.5).astype(int)
+        
+        # Convert to Python primitives for JSON serialization
+        probs_list = [float(p) for p in probs]
+        uncertainties_list = [float(u) for u in uncertainties]
+        pred_list = [int(p) for p in predictions]
+        
+        if return_all:
+            # Return all masks with their predictions
+            result = [valid_masks, pred_list]
+            if return_probabilities:
+                result.append(probs_list)
+            if return_uncertainty:
+                result.append(uncertainties_list)
+            return tuple(result)
+        else:
+            # Filter positive predictions
+            filtered_masks = []
+            filtered_probs = []
+            filtered_uncertainties = []
+            
+            for i, pred in enumerate(predictions):
+                if pred == 1:  # Positive class
+                    filtered_masks.append(valid_masks[i])
+                    if return_probabilities:
+                        filtered_probs.append(probs_list[i])
+                    if return_uncertainty:
+                        filtered_uncertainties.append(uncertainties_list[i])
+            
+            # Sort by probability (highest first) with uncertainty as secondary criteria
+            if filtered_masks and return_probabilities:
+                if return_uncertainty:
+                    # Sort by probability - uncertainty (high confidence = high prob, low uncertainty)
+                    confidence_scores = [p - u for p, u in zip(filtered_probs, filtered_uncertainties)]
+                    sorted_indices = np.argsort(confidence_scores)[::-1]
+                else:
+                    # Sort just by probability
+                    sorted_indices = np.argsort(filtered_probs)[::-1]
+                
+                filtered_masks = [filtered_masks[i] for i in sorted_indices]
+                filtered_probs = [filtered_probs[i] for i in sorted_indices]
+                if return_uncertainty:
+                    filtered_uncertainties = [filtered_uncertainties[i] for i in sorted_indices]
+            
+            result = [filtered_masks]
+            if return_probabilities:
+                result.append(filtered_probs)
+            if return_uncertainty:
+                result.append(filtered_uncertainties)
+            
+            return tuple(result)
+            
+    def get_model_diagnostics(self):
+        """
+        Return basic diagnostics of the Bayesian model
+        
+        Returns:
+            dict: A dictionary of diagnostic information
+        """
+        if not self.is_trained or self.trace is None:
+            return {"trained": False, "message": "Model not trained yet"}
+        
+        try:
+            # Get posterior statistics
+            summary = az.summary(self.trace, var_names=["alpha", "beta"])
+            
+            # Convert to Python types for JSON serialization
+            summary_dict = summary.to_dict()
+            
+            # Calculate effective sample size
+            ess = az.ess(self.trace)
+            
+            # Get r_hat diagnostics
+            r_hat = az.rhat(self.trace)
+            
+            return {
+                "trained": True,
+                "n_samples": self.num_samples,
+                "n_chains": self.chains,
+                "alpha_mean": float(summary["mean"]["alpha"]),
+                "alpha_std": float(summary["sd"]["alpha"]),
+                "beta_mean_abs": float(np.mean(np.abs(summary["mean"].filter(like="beta")))),
+                "r_hat_max": float(summary["r_hat"].max()),
+                "divergences": int(np.sum(self.trace.sample_stats.diverging.values)),
+                "feature_importance": self._get_feature_importance(),
+            }
+        except Exception as e:
+            return {"trained": True, "error": str(e)}
+    
+    def _get_feature_importance(self):
+        """
+        Extract feature importance from the Bayesian model
+        
+        Returns:
+            List of feature importance scores
+        """
+        if not self.is_trained or self.trace is None:
+            return []
+        
+        # Get posterior mean of beta parameters
+        beta_means = np.mean(self.trace.posterior.beta.values.reshape(-1, self.feature_dim), axis=0)
+        
+        # Get posterior std of beta parameters for uncertainty
+        beta_stds = np.std(self.trace.posterior.beta.values.reshape(-1, self.feature_dim), axis=0)
+        
+        # Calculate absolute mean as importance
+        importance = np.abs(beta_means)
+        
+        # Calculate signal-to-noise ratio (mean/std) for reliability
+        reliability = np.abs(beta_means) / (beta_stds + 1e-10)
+        
+        # Sort feature indices by importance
+        sorted_indices = np.argsort(importance)[::-1]
+        
+        # Get top 20 features or fewer if dimension is smaller
+        top_n = min(20, len(sorted_indices))
+        
+        result = []
+        for i in range(top_n):
+            idx = sorted_indices[i]
+            result.append({
+                "feature_idx": int(idx),
+                "importance": float(importance[idx]),
+                "coefficient": float(beta_means[idx]),
+                "std": float(beta_stds[idx]),
+                "reliability": float(reliability[idx])
+            })
+        
+        return result
