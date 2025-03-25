@@ -1,0 +1,38 @@
+{
+  "model": {
+    "variant": "small",
+    "checkpoint_path": "models/sam2_hiera_small.pt"
+  },
+  "inference": {
+    "points_per_side": 32,
+    "pred_iou_thresh": 0.7,
+    "stability_score_thresh": 0.85,
+    "box_nms_thresh": 0.6
+  },
+  "datasets": [
+    {
+      "name": "meatballs",
+      "data_path": "../data/processed/meatballs",
+      "label_path": "../data/processed/meatballs/labels",
+      "crop_coords": [30, 300, 200, 450]
+    },
+    {
+      "name": "cans",
+      "data_path": "../data/processed/cans",
+      "label_path": "../data/processed/cans/labels",
+      "crop_coords": [40, 590, 100, 640]
+    },
+    {
+      "name": "doughs",
+      "data_path": "../data/processed/doughs",
+      "label_path": "../data/processed/doughs/labels",
+      "crop_coords": [50, 640, 30, 450]
+    },
+    {
+      "name": "bottles",
+      "data_path": "../data/processed/bottles",
+      "label_path": "../data/processed/bottles/labels",
+      "crop_coords": [100, 480, 20, 640]
+    }
+  ]
+}
