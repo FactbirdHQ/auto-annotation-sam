@@ -12,27 +12,27 @@
   "datasets": [
     {
       "name": "meatballs",
-      "data_path": "../data/processed/meatballs",
-      "label_path": "../data/processed/meatballs/labels",
-      "crop_coords": [30, 300, 200, 450]
+      "img_path": "/images",
+      "gt_path": "/gt_masks",
+      "out_path": "/sam_masks"
     },
     {
       "name": "cans",
-      "data_path": "../data/processed/cans",
-      "label_path": "../data/processed/cans/labels",
-      "crop_coords": [40, 590, 100, 640]
+      "img_path": "/images",
+      "gt_path": "/gt_masks",
+      "out_path": "/sam_masks"
     },
     {
       "name": "doughs",
-      "data_path": "../data/processed/doughs",
-      "label_path": "../data/processed/doughs/labels",
-      "crop_coords": [50, 640, 30, 450]
+      "img_path": "/images",
+      "gt_path": "/gt_masks",
+      "out_path": "/sam_masks"
     },
     {
       "name": "bottles",
-      "data_path": "../data/processed/bottles",
-      "label_path": "../data/processed/bottles/labels",
-      "crop_coords": [100, 480, 20, 640]
+      "img_path": "/images",
+      "gt_path": "/gt_masks",
+      "out_path": "/sam_masks"
     }
   ]
 }

@@ -1,6 +1,6 @@
 {
-  "inference.points_per_side": [16, 32, 64],
+  "inference.points_per_side": [32],
   "inference.pred_iou_thresh": [0.6, 0.7, 0.8],
   "inference.stability_score_thresh": [0.8, 0.85, 0.9],
-  "inference.box_nms_thresh": [0.5, 0.6, 0.7]
+  "inference.box_nms_thresh": [0.6]
 }

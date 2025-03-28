@@ -1,4 +1,3 @@
-
 import os
 import glob
 import json
@@ -15,47 +14,8 @@ from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 from sam2.build_sam import build_sam2
 from sam2.utils.misc import variant_to_config_mapping
 
-
-def setup_directories(base_path, dataset_name):
-    """
-    Create necessary directories for storing inference results
-    
-    Args:
-        base_path: Base output path
-        dataset_name: Name of the dataset
-        
-    Returns:
-        Dictionary with created directory paths
-    """
-    output_path = Path(base_path) / dataset_name
-    
-    dirs = {
-        "main": output_path,
-        "masks": output_path / "masks",
-        "images": output_path / "images",
-        "metadata": output_path / "metadata",
-    }
-    
-    for dir_path in dirs.values():
-        os.makedirs(dir_path, exist_ok=True)
-    
-    return dirs
-
-
-def crop_image(image, crop_coords):
-    """
-    Crop image using provided coordinates
-    
-    Args:
-        image: Input image array
-        crop_coords: List/tuple of [y_start, y_end, x_start, x_end]
-        
-    Returns:
-        Cropped image
-    """
-    y_start, y_end, x_start, x_end = crop_coords
-    return image[y_start:y_end, x_start:x_end]
-
+# Import parameter tuning functions
+from sam_param_tune import load_param_grid, tune_parameters
 
 def binary_mask_to_polygon(mask, simplify=True, epsilon=1.0):
     """
@@ -87,41 +47,6 @@ def binary_mask_to_polygon(mask, simplify=True, epsilon=1.0):
     
     return polygon
 
-def save_mask(mask, output_path, format="txt", img_width=None, img_height=None, class_id=0):
-    """
-    Save a binary mask to a file
-    
-    Args:
-        mask: Binary mask array
-        output_path: Path to save the mask
-        format: Format to save ("txt", "png", or "yolo")
-        img_width: Width of original image (for YOLO format)
-        img_height: Height of original image (for YOLO format)
-        class_id: Class ID (for YOLO format)
-    """
-    if format == "txt":
-        np.savetxt(output_path, mask.astype(np.uint8), fmt='%d', delimiter=',')
-    elif format == "png":
-        cv2.imwrite(output_path, mask.astype(np.uint8) * 255)
-    elif format == "yolo":
-        # Convert mask to polygon points
-        polygon = binary_mask_to_polygon(mask)
-        
-        if not polygon:  # Skip if no valid polygon
-            return
-            
-        # Normalize coordinates to YOLO format [0-1]
-        normalized_points = []
-        for i in range(0, len(polygon), 2):
-            if i+1 < len(polygon):
-                x, y = polygon[i], polygon[i+1]
-                normalized_points.append(x / img_width)
-                normalized_points.append(y / img_height)
-        
-        # Write to file in YOLO format: class_id x1 y1 x2 y2 ...
-        with open(output_path, 'w') as f:
-            f.write(f"{class_id} " + " ".join([f"{p:.6f}" for p in normalized_points]))
-
 def load_config(config_path):
     """
     Load configuration from JSON file
@@ -148,37 +73,47 @@ def save_runtime_stats(runtime_stats, output_path):
         json.dump(runtime_stats, f, indent=2)
 
 
-def process_dataset(dataset_config, mask_generator, output_base_path, save_format="txt", yolo_dir=None):
+def process_dataset(dataset_config, mask_generator, data_base_path):
     """
     Process a single dataset with SAM2
     
     Args:
         dataset_config: Configuration for the dataset
         mask_generator: SAM2 mask generator
-        output_base_path: Base path for output
-        save_format: Format to save masks ("txt", "png", or "yolo")
-        yolo_dir: Directory to save YOLO format masks (if save_format is "yolo")
+        data_base_path: Base path for data
         
     Returns:
         Dictionary with runtime statistics
     """
     dataset_name = dataset_config['name']
-    crop_coords = dataset_config['crop_coords']
-    data_path = dataset_config.get('data_path', '')
+    
+    data_base = Path(data_base_path)
+    dataset_dir = data_base / dataset_name
+    
+    # Handle paths that start with '/' by removing the leading slash
+    img_path_str = dataset_config.get('img_path', '')
+    if img_path_str.startswith('/'):
+        img_path_str = img_path_str[1:]
+    
+    out_path_str = dataset_config.get('out_path', '')
+    if out_path_str.startswith('/'):
+        out_path_str = out_path_str[1:]
+    
+    img_path = dataset_dir / img_path_str
+    out_path = dataset_dir / out_path_str
+    
+    print(f"Image path: {img_path}")
+    print(f"Output path: {out_path}")
+    
+    # Ensure output directory exists
+    out_path.mkdir(parents=True, exist_ok=True)
     
     print(f"\nProcessing {dataset_name} dataset...")
-    
-    # Setup directories
-    dirs = setup_directories(output_base_path, dataset_name)
-    
-    # Find images
-    images_path = Path(data_path) / "images" / "train"
-    img_files = glob.glob(str(images_path / "*.PNG"))
-    if not img_files:
-        img_files = glob.glob(str(images_path / "*.png"))
+
+    img_files = glob.glob(str(img_path / "*.PNG"))
     
     if not img_files:
-        print(f"No images found in {images_path}")
+        print(f"No images found in {img_path}")
         return {}
     
     print(f"Found {len(img_files)} images.")
@@ -198,21 +133,15 @@ def process_dataset(dataset_config, mask_generator, output_base_path, save_forma
         # Get image name without extension
         img_name = os.path.splitext(os.path.basename(img_file))[0]
         
-        # Load and crop image
+        # Load image
         img = cv2.imread(img_file)
         if img is None:
             print(f"Error: Could not read image {img_file}")
             continue
-            
-        cropped_img = crop_image(img, crop_coords)
-        
-        # Save cropped image
-        cropped_img_path = dirs["images"] / f"{img_name}.png"
-        cv2.imwrite(str(cropped_img_path), cropped_img)
         
         # Run SAM2 inference with timing
         start_time = time.time()
-        masks = mask_generator.generate(cropped_img)
+        masks = mask_generator.generate(img)
         inference_time = time.time() - start_time
         
         # Update statistics
@@ -221,16 +150,17 @@ def process_dataset(dataset_config, mask_generator, output_base_path, save_forma
         stats["total_masks"] += len(masks)
         
         # Save all masks for this image in a single file
-        if save_format == "txt":
-            mask_output_path = dirs["masks"] / f"{img_name}.txt"
-            with open(mask_output_path, 'w') as f:
-                for i, mask_data in enumerate(masks):
-                    # Extract the segmentation mask
-                    mask = mask_data["segmentation"]
-                    # Convert to string representation
-                    mask_str = ','.join(map(str, mask.astype(np.uint8).flatten()))
-                    # Write to file with mask index
-                    f.write(f"Mask {i}: {mask_str}\n")
+        mask_output_path = out_path / f"{img_name}.txt"
+        with open(mask_output_path, 'w') as f:
+            for i, mask_data in enumerate(masks):
+                # Extract the segmentation mask
+                mask = mask_data["segmentation"]
+
+                poly_mask = binary_mask_to_polygon(mask)
+                # Convert to string representation
+                mask_str = ','.join(map(str, poly_mask))
+                # Write to file with mask index
+                f.write(f"{mask_str}\n")
     
     # Calculate and save summary statistics
     stats["end_time"] = time.time()
@@ -239,7 +169,7 @@ def process_dataset(dataset_config, mask_generator, output_base_path, save_forma
     stats["avg_masks_per_image"] = np.mean(stats["masks_per_image"])
     
     # Save statistics
-    stats_path = dirs["main"] / "runtime_stats.json"
+    stats_path = Path(data_base_path) / f"{dataset_name}_runtime_stats.json"
     save_runtime_stats(stats, stats_path)
     
     print(f"Completed processing {dataset_name}:")
@@ -253,24 +183,20 @@ def process_dataset(dataset_config, mask_generator, output_base_path, save_forma
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SAM2 Inference on HPC Cluster")
+    parser = argparse.ArgumentParser(description="SAM2 Inference on one or more Dataset")
     parser.add_argument("--config", type=str, required=True, help="Path to configuration JSON file")
-    parser.add_argument("--output", type=str, default="sam2_inference_results", help="Base output directory")
-    parser.add_argument("--save_format", type=str, default="txt", choices=["txt", "png", "yolo"], 
-                        help="Format to save masks")
-    parser.add_argument("--yolo_dir", type=str, help="Directory to save YOLO format masks (optional)")
+    parser.add_argument("--data", type=str, required=True, help="Path to data directory")
+    parser.add_argument("--param-grid", type=str, help="Path to parameter grid JSON file for tuning")
+    parser.add_argument("--tune", action="store_true", help="Perform parameter tuning")
+    parser.add_argument("--tune-samples", type=int, default=25, help="Number of samples per dataset for tuning")
     args = parser.parse_args()
-    
-
     
     # Load configuration
     config = load_config(args.config)
     
-    # Create output directory
-    os.makedirs(args.output, exist_ok=True)
-    
     # Save config for reference 
-    with open(os.path.join(args.output, "used_config.json"), 'w') as f:
+    data_base = Path(args.data)
+    with open(data_base / "used_config.json", 'w') as f:
         json.dump(config, f, indent=2)
     
     # Initialize device
@@ -288,7 +214,40 @@ def main():
             device=device,
         )
         
-        # Initialize mask generator
+        # Parameter tuning if requested
+        if args.tune:
+            if not args.param_grid:
+                print("Error: --param-grid must be specified when --tune is used")
+                return
+            
+            print("\nPerforming parameter tuning...")
+            param_grid = load_param_grid(args.param_grid)
+            
+            # Tune parameters
+            best_result = tune_parameters(
+                config,
+                param_grid,
+                SAM2AutomaticMaskGenerator,
+                model,
+                args.data,
+                num_samples=args.tune_samples
+            )
+            
+            # Update config with best parameters
+            for param_name, value in best_result["parameters"].items():
+                parts = param_name.split('.')
+                current = config
+                for part in parts[:-1]:
+                    current = current[part]
+                current[parts[-1]] = value
+            
+            # Save updated config
+            with open(data_base / "tuned_config.json", 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            print(f"Updated configuration saved to {data_base / 'tuned_config.json'}")
+        
+        # Initialize mask generator with (potentially updated) config
         mask_generator = SAM2AutomaticMaskGenerator(
             model,
             points_per_side=config['inference']['points_per_side'],
@@ -309,19 +268,17 @@ def main():
         dataset_stats = process_dataset(
             dataset_config, 
             mask_generator, 
-            args.output,
-            save_format=args.save_format,
-            yolo_dir=args.yolo_dir
+            args.data,
         )
         all_stats[dataset_config['name']] = dataset_stats
     
     # Save overall statistics
-    overall_stats_path = os.path.join(args.output, "all_runtime_stats.json")
+    overall_stats_path = os.path.join(args.data, "all_runtime_stats.json")
     with open(overall_stats_path, 'w') as f:
         json.dump(all_stats, f, indent=2)
     
     print("\nSAM2 inference completed for all datasets!")
-    print(f"Results saved to: {args.output}")
+    print(f"Results saved to: {args.data}")
 
 
 if __name__ == "__main__":
