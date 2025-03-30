@@ -3,7 +3,7 @@ from sklearn.metrics import auc
 import matplotlib.pyplot as plt
 
 
-def evaluate_binary_masks(gt_masks, pred_masks, iou_threshold=0.5):
+def evaluate_binary_masks(gt_masks, pred_masks, iou_threshold=0.6):
     """
     Calculate evaluation statistics between ground truth and predicted binary masks.
     

@@ -1,31 +1,336 @@
 from pathlib import Path
 import cv2
 import numpy as np
-import typer
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler
 from typing import List, Tuple, Union
+import numpy as np
+from sklearn.model_selection import KFold
+import os
+import torch
+import random
+
+class SegmentationDataset(Dataset):
+    """
+    Dataset for loading images and masks in YOLO segmentation format,
+    specifically designed to work with the embedding-classifier framework.
+    """
+    
+    def __init__(self, dataset_path, class_id=1):
+        """
+        Initialize dataset for a specific object class.
+        
+        Args:
+            dataset_path (str): Path to the specific dataset directory
+            class_id (int): The class ID for this dataset
+        """
+        self.dataset_path = Path(dataset_path)
+        self.images_path = self.dataset_path / 'images'
+        self.gt_path = self.dataset_path / 'gt_masks'
+        self.sam_masks_path = self.dataset_path / 'sam_masks'
+        self.class_id = class_id
+        
+        # Verify folders exist
+        if not self.images_path.exists():
+            raise FileNotFoundError(f"Images directory not found: {self.images_path}")
+        if not self.gt_path.exists():
+            raise FileNotFoundError(f"GT masks directory not found: {self.gt_path}")
+        if not self.sam_masks_path.exists():
+            raise FileNotFoundError(f"SAM masks directory not found: {self.sam_masks_path}")
+        
+        # Get sorted list of image filenames
+        self.image_files = sorted([f for f in os.listdir(self.images_path) 
+                                   if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        
+        # Store the dataset name
+        self.dataset_name = self.dataset_path.name
+    
+    def __len__(self):
+        """Return the total number of samples in the dataset."""
+        return len(self.image_files)
+    
+    def _parse_yolo_segmentation(self, txt_path, is_sam_mask=False):
+        """
+        Parse YOLO segmentation format.
+        
+        YOLO format: class_id x1 y1 x2 y2 ... xn yn
+        Where x and y are normalized coordinates (0-1)
+        
+        Args:
+            txt_path: Path to the YOLO format text file
+            is_sam_mask: Whether this is a SAM mask (class_id is placeholder)
+            
+        Returns:
+            List of dictionaries, each containing 'class_id' and 'polygon' keys
+        """
+        masks = []
+        
+        # Check if file exists (some frames might not have annotations)
+        if not txt_path.exists():
+            return masks
+            
+        # Parse each line in the txt file
+        with open(txt_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 5:  # Need at least class_id and 2 points
+                    continue
+                    
+                # For SAM masks, class_id is a placeholder
+                # For GT masks, use the dataset's class_id
+                class_id = 0 if is_sam_mask else self.class_id
+                
+                # Parse all x,y pairs (every two values after class_id)
+                polygon = []
+                for i in range(1, len(parts), 2):
+                    if i+1 < len(parts):
+                        x, y = float(parts[i]), float(parts[i+1])
+                        polygon.append((x, y))
+                
+                masks.append({
+                    'class_id': class_id,
+                    'polygon': polygon
+                })
+                
+        return masks
+    
+    def _polygons_to_binary_mask(self, polygons, img_size):
+        """
+        Convert YOLO normalized polygons to a binary mask.
+        
+        Args:
+            polygons: List of polygon dicts with 'class_id' and 'polygon' keys
+            img_size: Tuple of (width, height) of the image
+            
+        Returns:
+            np.ndarray: Binary mask with 1s where objects are present
+        """
+        width, height = img_size
+        mask = np.zeros((height, width), dtype=np.uint8)
+        
+        for poly_data in polygons:
+            polygon = poly_data['polygon']
+            
+            # Convert normalized coordinates to pixel coordinates
+            pixel_polygon = [(int(x * width), int(y * height)) for x, y in polygon]
+            
+            # Convert to format for OpenCV drawing
+            points = np.array(pixel_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            
+            # Fill polygon
+            cv2.fillPoly(mask, [points], 1)
+                
+        return mask
+    
+    def __getitem__(self, idx):
+        """
+        Get a sample from the dataset at the given index.
+        
+        Returns dictionary with:
+            - image: Image as numpy array
+            - gt_masks: Ground truth mask data in YOLO format
+            - sam_masks: SAM mask data in YOLO format
+            - gt_binary_mask: Rasterized GT mask as numpy array
+            - sam_binary_mask: Rasterized SAM mask as numpy array
+            - has_gt: Boolean indicating if GT masks exist
+            - filename: Image filename
+            - dataset: Dataset name
+        """
+        # Get filenames
+        img_filename = self.image_files[idx]
+        base_filename = os.path.splitext(img_filename)[0]
+        
+        # Load image directly as numpy array
+        img_path = str(self.images_path / img_filename)
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB
+        img_height, img_width = image.shape[:2]
+            
+        # Load GT annotations
+        gt_path = self.gt_path / f"{base_filename}.txt"
+        gt_masks = self._parse_yolo_segmentation(gt_path, is_sam_mask=False)
+        
+        # Load SAM masks
+        sam_mask_path = self.sam_masks_path / f"{base_filename}.txt"
+        sam_masks = self._parse_yolo_segmentation(sam_mask_path, is_sam_mask=True)
+        
+        # Convert polygon annotations to binary masks
+        gt_binary_mask = self._polygons_to_binary_mask(gt_masks, (img_width, img_height))
+        sam_binary_mask = self._polygons_to_binary_mask(sam_masks, (img_width, img_height))
+        
+        # Return sample with all information
+        return {
+            'image': image,            # Numpy array
+            'gt_masks': gt_masks,      # YOLO polygon format
+            'sam_masks': sam_masks,    # YOLO polygon format
+            'gt_binary_mask': gt_binary_mask,  # Rasterized binary mask
+            'sam_binary_mask': sam_binary_mask,  # Rasterized binary mask
+            'has_gt': len(gt_masks) > 0,
+            'filename': img_filename,
+            'dataset': self.dataset_name
+        }
 
 
-class MyDataset(Dataset):
-    """My custom dataset."""
+class KFoldSegmentationManager:
+    """
+    Manager for K-fold cross-validation with the segmentation dataset,
+    specifically adapted for the embedding-classifier framework.
+    """
+    
+    def __init__(self, dataset_path, class_id=0):
+        """
+        Initialize dataset manager with K-fold CV support.
+        
+        Args:
+            dataset_path (str): Path to the dataset directory
+            class_id (int): The class ID for this dataset
+        """
+        self.dataset_path = Path(dataset_path)
+        self.class_id = class_id
+        
+        # Create the dataset
+        self.dataset = SegmentationDataset(
+            dataset_path=dataset_path,
+            class_id=class_id
+        )
+        
+        # Store dataset name for reference
+        self.dataset_name = self.dataset.dataset_name
+    
+    def __len__(self):
+        """Return the total number of samples in the dataset."""
+        return len(self.dataset)
+    
+    def get_dataset_info(self):
+        """Return information about the dataset."""
+        return {
+            'dataset_name': self.dataset_name,
+            'class_id': self.class_id,
+            'total_samples': len(self.dataset)
+        }
+    
+    def get_training_data(self, dataloader):
+        """
+        Get training data from dataloader in a format suitable for your classifier.
+        
+        Your classifier.fit() expects:
+        - images: List of images (numpy arrays)
+        - masks: List of masks (numpy arrays)
+        - labels: List of class labels
+        
+        Args:
+            dataloader: PyTorch DataLoader with dataset samples
+            
+        Returns:
+            tuple: (images, masks, labels) ready for classifier.fit()
+        """
+        images = []
+        gt_masks = []
+        labels = []
+        
+        for batch in dataloader:
+            batch_images = batch['image']
+            batch_gt_masks = batch['gt_binary_mask']
+            batch_has_gt = batch['has_gt']
+            
+            # Process each item in the batch
+            for i in range(len(batch_images)):
+                # Only include samples with ground truth
+                if batch_has_gt[i]:
+                    # Get image as numpy array
+                    image = batch_images[i].numpy() if isinstance(batch_images[i], torch.Tensor) else batch_images[i]
+                    
+                    # Get GT mask as numpy array
+                    gt_mask = batch_gt_masks[i].numpy() if isinstance(batch_gt_masks[i], torch.Tensor) else batch_gt_masks[i]
+                    
+                    # Add to training data
+                    images.append(image)
+                    gt_masks.append(gt_mask)
+                    labels.append(self.class_id)  # Use dataset class_id as label
+                
+        return images, gt_masks, labels
+        
+    def get_prediction_data(self, dataloader):
+        """
+        Get prediction data from dataloader.
+        
+        Your classifier.predict() expects:
+        - image: Input image (numpy array)
+        - candidate_masks: List of masks to classify (numpy arrays)
+        
+        Args:
+            dataloader: PyTorch DataLoader with dataset samples
+            
+        Returns:
+            list: List of (image, candidate_masks) tuples for classifier.predict()
+        """
+        prediction_data = []
+        
+        for batch in dataloader:
+            batch_images = batch['image']
+            batch_sam_masks = batch['sam_binary_mask']
+            
+            # Process each item in the batch
+            for i in range(len(batch_images)):
+                # Get image as numpy array
+                image = batch_images[i].numpy() if isinstance(batch_images[i], torch.Tensor) else batch_images[i]
+                
+                # Get SAM mask as numpy array
+                sam_mask = batch_sam_masks[i].numpy() if isinstance(batch_sam_masks[i], torch.Tensor) else batch_sam_masks[i]
+                
+                # Some samples might not have SAM masks
+                if np.sum(sam_mask) > 0:
+                    prediction_data.append((image, [sam_mask]))
+                
+        return prediction_data
+    
+    def get_kfold_dataloaders(self, k=5, batch_size=8, shuffle=True, random_state=42):
+        """
+        Generate K-fold cross-validation splits for this dataset.
+        
+        Args:
+            k (int): Number of folds
+            batch_size (int): Batch size for dataloaders
+            shuffle (bool): Whether to shuffle the data
+            random_state (int): Random seed for reproducibility
+            
+        Returns:
+            A list of (train_dataloader, val_dataloader) pairs for each fold
+        """
+        # Initialize random number generator for reproducibility
+        np.random.seed(random_state)
+        random.seed(random_state)
+        torch.manual_seed(random_state)
+        
+        # Create K-fold splitter
+        kf = KFold(n_splits=k, shuffle=shuffle, random_state=random_state)
+        
+        # Store dataloaders for each fold
+        fold_dataloaders = []
+        
+        # Generate indices for each fold
+        indices = list(range(len(self.dataset)))
+        for train_idx, val_idx in kf.split(indices):
+            train_sampler = SubsetRandomSampler(train_idx)
+            val_sampler = SubsetRandomSampler(val_idx)
+            
+            train_loader = DataLoader(
+                dataset=self.dataset,
+                batch_size=batch_size,
+                sampler=train_sampler
+            )
+            
+            val_loader = DataLoader(
+                dataset=self.dataset,
+                batch_size=batch_size,
+                sampler=val_sampler
+            )
+            
+            fold_dataloaders.append((train_loader, val_loader))
+        
+        return fold_dataloaders
 
-    def __init__(self, data_path: Path) -> None:
-        self.data_path = data_path
 
-    def __len__(self) -> int:
-        """Return the length of the dataset."""
-
-    def __getitem__(self, index: int):
-        """Return a given sample from the dataset."""
-
-    def preprocess(self, output_folder: Path) -> None:
-        """Preprocess the raw data and save it to the output folder."""
-
-def preprocess(data_path: Path, output_folder: Path) -> None:
-    print("Preprocessing data...")
-    dataset = MyDataset(data_path)
-    dataset.preprocess(output_folder)
 
 def load_and_crop_data(img_path, label_path, crop_coords=None):
     """
@@ -251,6 +556,3 @@ def sort_masks(filtered_masks, filtered_probs):
     sorted_probs = list(sorted_probs)
 
     return sorted_masks, sorted_probs
-
-if __name__ == "__main__":
-    typer.run(preprocess)

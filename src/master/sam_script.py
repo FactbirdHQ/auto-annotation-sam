@@ -139,6 +139,9 @@ def process_dataset(dataset_config, mask_generator, data_base_path):
             print(f"Error: Could not read image {img_file}")
             continue
         
+        # Get image dimensions for normalization
+        img_height, img_width = img.shape[:2]
+        
         # Run SAM2 inference with timing
         start_time = time.time()
         masks = mask_generator.generate(img)
@@ -156,11 +159,31 @@ def process_dataset(dataset_config, mask_generator, data_base_path):
                 # Extract the segmentation mask
                 mask = mask_data["segmentation"]
 
+                # Get polygon points
                 poly_mask = binary_mask_to_polygon(mask)
-                # Convert to string representation
-                mask_str = ','.join(map(str, poly_mask))
-                # Write to file with mask index
-                f.write(f"{mask_str}\n")
+                
+                # Skip if no valid polygon was found
+                if not poly_mask:
+                    continue
+                
+                # Convert polygon to numpy array and reshape to (N, 2)
+                poly_points = np.array(poly_mask).reshape(-1, 2)
+                
+                # Normalize coordinates (YOLO format)
+                poly_points_normalized = poly_points.copy().astype(float)
+                poly_points_normalized[:, 0] /= img_width  # Normalize X
+                poly_points_normalized[:, 1] /= img_height  # Normalize Y
+                
+                # Class ID (using 0 for all masks)
+                class_id = 0
+                
+                # Format in YOLO style: class_id x1 y1 x2 y2...
+                yolo_string = f"{class_id}"
+                for x, y in poly_points_normalized:
+                    yolo_string += f" {x:.6f} {y:.6f}"
+                
+                # Write to file
+                f.write(f"{yolo_string}\n")
     
     # Calculate and save summary statistics
     stats["end_time"] = time.time()

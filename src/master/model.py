@@ -16,8 +16,12 @@ class Embedding:
     def __init__(self, config=None):
         self.config = config or {}
 
+        self.embeding_type = None
         #Hyper parameters
         self.padding = config.get('padding', 0)
+
+    def get_embedding_type(self):
+        return self.embeding_type
 
     def get_masked_region(self, image, mask):
         """Helper function to extract and process masked region with padding"""
@@ -82,6 +86,8 @@ class Embedding:
 class CLIPEmbedding(Embedding):
     def __init__(self, config=None, device=None):
         super().__init__(config)
+        self.embeding_type = 'CLIP'
+
         # Set up device
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -137,6 +143,7 @@ class CLIPEmbedding(Embedding):
 class HoGEmbedding(Embedding):
     def __init__(self, config=None):
         super().__init__(config)
+        self.embeding_type = 'HOG'
 
         # HOG parameters
         self.hog_cell_size = self.config.get('hog_cell_size',(8,8))
@@ -180,6 +187,8 @@ class HoGEmbedding(Embedding):
 class ResNET18Embedding(Embedding):
     def __init__(self, config=None, device=None):
         super().__init__(config)
+        self.embeding_type = 'ResNet18'
+
         # Set up device
         if device is None:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -296,6 +305,9 @@ class Classifier:
         self.embedding = embedding
         self.config = config or {}
 
+        self.embedding_type = self.embedding.get_embedding_type()
+        self.classifier_type = None
+
         # PCA setup
         self.pca = None
         if config.get('use_PCA', False):
@@ -305,6 +317,9 @@ class Classifier:
         # StandardScaler setup
         self.use_scaler = config.get('use_scaler', True)
         self.scaler = StandardScaler() if self.use_scaler else None
+
+    def get_types(self):
+        return self.embedding_type, self.classifier_type
         
     def extract_features(self, image, mask):
         """Extract features using the provided embedding"""
@@ -446,6 +461,8 @@ class KNNClassifier(Classifier):
             embedding: Instance of an Embedding class
         """
         super().__init__(config, embedding)
+
+        self.classifier_type = 'KNN'
         
         # Initialize KNN classifier with specified parameters
         self.n_neighbors = self.config.get('n_neighbors', 5)
@@ -552,6 +569,8 @@ class SVMClassifier(Classifier):
             embedding: Instance of an Embedding class
         """
         super().__init__(config, embedding)
+
+        self.classifier_type = 'SVM'
         
         # Initialize SVM classifier with specified parameters
         self.C = self.config.get('C', 1.0)
@@ -668,6 +687,8 @@ class RandomForestClassifier(Classifier):
             embedding: Instance of an Embedding class
         """
         super().__init__(config, embedding)
+
+        self.classifier_type = 'RF'
         
         # Initialize RF classifier with specified parameters
         self.n_estimators = self.config.get('n_estimators', 100)
@@ -777,6 +798,8 @@ class LogisticRegressionClassifier(Classifier):
             embedding: Instance of an Embedding class
         """
         super().__init__(config, embedding)
+
+        self.classifier_type = 'LR'
         
         # Initialize Logistic Regression classifier with specified parameters
         self.C = self.config.get('C', 1.0)
