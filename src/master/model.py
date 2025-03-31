@@ -187,7 +187,7 @@ class HoGEmbedding(Embedding):
 class ResNET18Embedding(Embedding):
     def __init__(self, config=None, device=None):
         super().__init__(config)
-        self.embeding_type = 'ResNet18'
+        self.embedding_type = 'ResNet18'
 
         # Set up device
         if device is None:
@@ -201,18 +201,19 @@ class ResNET18Embedding(Embedding):
         self.base_model = models.resnet18(pretrained=True)
         self.base_model.eval()
 
-        self.layers = self.config.get('layers',[2, 4, 6, 8])
+        self.layers = self.config.get('layers', [2, 4, 6, 8])
 
-        self.hooks = []
+        self.hook_handles = []
 
         # Set up hooks to capture outputs from specified layers
         for layer_idx in self.layers:
             if layer_idx < len(list(self.base_model.children())):
                 layer = list(self.base_model.children())[layer_idx]
-                hook = layer.register_forward_hook(self._get_hook(layer_idx))
-                self.hooks.append(hook)
+                # Store the hook handle returned by register_forward_hook
+                handle = layer.register_forward_hook(self._get_hook(layer_idx))
+                self.hook_handles.append(handle)
 
-        # Define image transformation pipeline
+        # Transform definition remains the same
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
@@ -284,9 +285,25 @@ class ResNET18Embedding(Embedding):
         return fused_features
 
     def cleanup(self):
-        """Remove hooks to prevent memory leaks"""
-        for hook in self.hooks:
-            hook.remove()
+        """
+        Remove all hooks to prevent memory leaks.
+        This method should be called when the embedding is no longer needed.
+        """
+        # Remove each hook handle
+        for handle in self.hook_handles:
+            handle.remove()
+        
+        # Clear the list
+        self.hook_handles = []
+        
+        # Clear any cached feature maps
+        if hasattr(self, 'feature_maps'):
+            self.feature_maps = {}
+        
+        # Optional: if using CUDA, clear the cache
+        if hasattr(self, 'device') and self.device == 'cuda':
+            import torch
+            torch.cuda.empty_cache()
 
 class Classifier:
     def __init__(self, config=None, embedding=None):
@@ -788,7 +805,7 @@ class RandomForestClassifier(Classifier):
             # Return masks with their predictions
             return list(zip(valid_masks, predictions))
 
-class LogisticRegressionClassifier(Classifier):
+class LogRegClassifier(Classifier):
     def __init__(self, config=None, embedding=None):
         """
         Logistic Regression classifier with embedding support
