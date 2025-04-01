@@ -10,6 +10,21 @@ import os
 import torch
 import random
 
+def custom_collate_fn(batch):
+        """Custom collate function to properly handle lists of dictionaries."""
+        batch_dict = {}
+        
+        # Initialize keys based on first item
+        for key in batch[0].keys():
+            batch_dict[key] = []
+        
+        # Add each item's data to the batch
+        for item in batch:
+            for key, value in item.items():
+                batch_dict[key].append(value)
+        
+        return batch_dict
+
 class SegmentationDataset(Dataset):
     """
     Dataset for loading images and masks in YOLO segmentation format,
@@ -125,22 +140,12 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, idx):
         """
         Get a sample from the dataset at the given index.
-        
-        Returns dictionary with:
-            - image: Image as numpy array
-            - gt_masks: Ground truth mask data in YOLO format
-            - sam_masks: SAM mask data in YOLO format
-            - gt_binary_mask: Rasterized GT mask as numpy array
-            - sam_binary_mask: Rasterized SAM mask as numpy array
-            - has_gt: Boolean indicating if GT masks exist
-            - filename: Image filename
-            - dataset: Dataset name
         """
         # Get filenames
         img_filename = self.image_files[idx]
         base_filename = os.path.splitext(img_filename)[0]
         
-        # Load image directly as numpy array
+        # Load image
         img_path = str(self.images_path / img_filename)
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)  # Convert to RGB
@@ -148,24 +153,54 @@ class SegmentationDataset(Dataset):
             
         # Load GT annotations
         gt_path = self.gt_path / f"{base_filename}.txt"
-        gt_masks = self._parse_yolo_segmentation(gt_path, is_sam_mask=False)
+        gt_masks_data = self._parse_yolo_segmentation(gt_path, is_sam_mask=False)
         
         # Load SAM masks
         sam_mask_path = self.sam_masks_path / f"{base_filename}.txt"
-        sam_masks = self._parse_yolo_segmentation(sam_mask_path, is_sam_mask=True)
+        sam_masks_data = self._parse_yolo_segmentation(sam_mask_path, is_sam_mask=True)
         
-        # Convert polygon annotations to binary masks
-        gt_binary_mask = self._polygons_to_binary_mask(gt_masks, (img_width, img_height))
-        sam_binary_mask = self._polygons_to_binary_mask(sam_masks, (img_width, img_height))
+        # Convert polygon annotations to INDIVIDUAL binary masks (not combined)
+        gt_binary_masks = []
+        for mask_data in gt_masks_data:
+            mask = np.zeros((img_height, img_width), dtype=np.uint8)
+            polygon = mask_data['polygon']
+            pixel_polygon = [(int(x * img_width), int(y * img_height)) for x, y in polygon]
+            points = np.array(pixel_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [points], 1)
+            gt_binary_masks.append(mask)
+            
+        sam_binary_masks = []
+        for mask_data in sam_masks_data:
+            mask = np.zeros((img_height, img_width), dtype=np.uint8)
+            polygon = mask_data['polygon']
+            pixel_polygon = [(int(x * img_width), int(y * img_height)) for x, y in polygon]
+            points = np.array(pixel_polygon, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(mask, [points], 1)
+            sam_binary_masks.append(mask)
+            
+        # Process segmentation masks
+        combined_masks, combined_labels = [], []
+        if gt_binary_masks and sam_binary_masks:
+            combined_masks, combined_labels = process_segmentation_masks(
+                gt_binary_masks, sam_binary_masks, iou_threshold=0.5
+            )
+        elif gt_binary_masks:
+            combined_masks = gt_binary_masks
+            combined_labels = [1] * len(gt_binary_masks)
+        elif sam_binary_masks:
+            combined_masks = sam_binary_masks
+            combined_labels = [0] * len(sam_binary_masks)
         
         # Return sample with all information
         return {
-            'image': image,            # Numpy array
-            'gt_masks': gt_masks,      # YOLO polygon format
-            'sam_masks': sam_masks,    # YOLO polygon format
-            'gt_binary_mask': gt_binary_mask,  # Rasterized binary mask
-            'sam_binary_mask': sam_binary_mask,  # Rasterized binary mask
-            'has_gt': len(gt_masks) > 0,
+            'image': image,
+            'gt_masks': gt_masks_data,  # Original polygon data
+            'sam_masks': sam_masks_data,  # Original polygon data
+            'gt_binary_masks': gt_binary_masks,  # List of individual GT binary masks
+            'sam_binary_masks': sam_binary_masks,  # List of individual SAM binary masks
+            'combined_masks': combined_masks,  # List of combined masks (GT + non-overlapping SAM)
+            'combined_labels': combined_labels,  # Corresponding labels (1 for GT, 0 for SAM)
+            'has_gt': len(gt_masks_data) > 0,
             'filename': img_filename,
             'dataset': self.dataset_name
         }
@@ -213,24 +248,17 @@ class KFoldSegmentationManager:
         """
         Get training data from dataloader in a format suitable for your classifier.
         
-        Your classifier.fit() expects:
-        - images: List of images (numpy arrays)
-        - masks: List of masks (numpy arrays)
-        - labels: List of class labels
-        
-        Args:
-            dataloader: PyTorch DataLoader with dataset samples
-            
         Returns:
             tuple: (images, masks, labels) ready for classifier.fit()
         """
         images = []
-        gt_masks = []
-        labels = []
+        masks_per_image = []  # Will be a list of lists
+        labels_per_image = []  # Will be a list of lists
         
         for batch in dataloader:
             batch_images = batch['image']
-            batch_gt_masks = batch['gt_binary_mask']
+            batch_combined_masks = batch['combined_masks']
+            batch_combined_labels = batch['combined_labels']
             batch_has_gt = batch['has_gt']
             
             # Process each item in the batch
@@ -240,47 +268,57 @@ class KFoldSegmentationManager:
                     # Get image as numpy array
                     image = batch_images[i].numpy() if isinstance(batch_images[i], torch.Tensor) else batch_images[i]
                     
-                    # Get GT mask as numpy array
-                    gt_mask = batch_gt_masks[i].numpy() if isinstance(batch_gt_masks[i], torch.Tensor) else batch_gt_masks[i]
+                    # Get masks and labels
+                    masks = batch_combined_masks[i]
+                    labels = batch_combined_labels[i]
                     
                     # Add to training data
                     images.append(image)
-                    gt_masks.append(gt_mask)
-                    labels.append(self.class_id)  # Use dataset class_id as label
+                    masks_per_image.append(masks)
+                    labels_per_image.append(labels)
                 
-        return images, gt_masks, labels
+        return images, masks_per_image, labels_per_image
         
-    def get_prediction_data(self, dataloader):
+    def get_prediction_data(self, dataloader, return_combined=False):
         """
-        Get prediction data from dataloader.
-        
-        Your classifier.predict() expects:
-        - image: Input image (numpy array)
-        - candidate_masks: List of masks to classify (numpy arrays)
+        Get prediction data from dataloader, including ground truth masks for validation.
         
         Args:
             dataloader: PyTorch DataLoader with dataset samples
+            return_combined: If True, returns combined candidate masks (both GT and SAM),
+                            otherwise returns only SAM masks (default: False)
             
         Returns:
-            list: List of (image, candidate_masks) tuples for classifier.predict()
+            list: List of (image, candidate_masks, gt_masks) tuples for prediction and validation
         """
         prediction_data = []
         
         for batch in dataloader:
             batch_images = batch['image']
-            batch_sam_masks = batch['sam_binary_mask']
+            batch_gt_binary_masks = batch['gt_binary_masks']  # Ground truth masks for validation
+            
+            # Choose which candidate masks to use based on the mode
+            if return_combined:
+                # Use combined masks (both GT and SAM) as candidates
+                batch_candidate_masks = batch['combined_masks']
+            else:
+                # Use only SAM masks as candidates
+                batch_candidate_masks = batch['sam_binary_masks']
             
             # Process each item in the batch
             for i in range(len(batch_images)):
                 # Get image as numpy array
                 image = batch_images[i].numpy() if isinstance(batch_images[i], torch.Tensor) else batch_images[i]
                 
-                # Get SAM mask as numpy array
-                sam_mask = batch_sam_masks[i].numpy() if isinstance(batch_sam_masks[i], torch.Tensor) else batch_sam_masks[i]
+                # Get candidate masks for this image
+                candidate_masks = batch_candidate_masks[i]
                 
-                # Some samples might not have SAM masks
-                if np.sum(sam_mask) > 0:
-                    prediction_data.append((image, [sam_mask]))
+                # Get ground truth masks for this image
+                gt_masks = batch_gt_binary_masks[i]
+                
+                # Only add to prediction data if there are candidate masks
+                if candidate_masks and len(candidate_masks) > 0:
+                    prediction_data.append((image, candidate_masks, gt_masks))
                 
         return prediction_data
     
@@ -317,20 +355,22 @@ class KFoldSegmentationManager:
             train_loader = DataLoader(
                 dataset=self.dataset,
                 batch_size=batch_size,
-                sampler=train_sampler
+                sampler=train_sampler,
+                collate_fn=custom_collate_fn
             )
             
             val_loader = DataLoader(
                 dataset=self.dataset,
                 batch_size=batch_size,
-                sampler=val_sampler
+                sampler=val_sampler,
+                collate_fn=custom_collate_fn
             )
             
             fold_dataloaders.append((train_loader, val_loader))
         
         return fold_dataloaders
 
-
+##### Below here works as inteded #####
 
 def load_and_crop_data(img_path, label_path, crop_coords=None):
     """

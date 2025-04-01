@@ -416,3 +416,229 @@ class SegmentationReportGenerator:
             plt.tight_layout()
             plt.savefig(os.path.join(self.output_dir, 'dataset_ranking_correlation.png'), dpi=300)
             plt.close()
+
+    def analyze_model_rank_stability(self, df):
+        """
+        Analyze how consistently each model combination ranks across datasets
+        
+        Args:
+            df: DataFrame with ablation results
+            
+        Returns:
+            Dictionary with rank stability metrics for each model
+        """
+        # Create a composite key for model combinations
+        df['Model'] = df['Embedding'] + '_' + df['Classifier']
+        
+        # Calculate ranks within each dataset
+        rank_df = df.copy()
+        rank_df['Rank'] = rank_df.groupby('Dataset')['F1 Score'].rank(ascending=False, method='min')
+        
+        # Group by model combination to analyze rank stability
+        model_stability = {}
+        
+        for model, group in rank_df.groupby('Model'):
+            embedding, classifier = model.split('_')
+            
+            # Calculate metrics on ranks
+            ranks = group['Rank'].values
+            datasets = group['Dataset'].values
+            f1_scores = group['F1 Score'].values
+            
+            model_stability[model] = {
+                'embedding': embedding,
+                'classifier': classifier,
+                'datasets': list(datasets),
+                'ranks': list(ranks.astype(int)),
+                'f1_scores': list(f1_scores),
+                'mean_rank': np.mean(ranks),
+                'median_rank': np.median(ranks),
+                'std_rank': np.std(ranks),
+                'min_rank': np.min(ranks),
+                'max_rank': np.max(ranks),
+                'rank_range': np.max(ranks) - np.min(ranks),
+                'rank_cv': np.std(ranks) / np.mean(ranks) if np.mean(ranks) > 0 else 0,
+                'consistent_top_3': np.all(ranks <= 3),
+                'datasets_count': len(datasets)
+            }
+        
+        return model_stability
+
+    def plot_rank_stability(self, model_stability):
+        """
+        Create visualizations for rank stability metrics
+        
+        Args:
+            model_stability: Dictionary with rank stability metrics
+        """
+        # 1. Rank variability chart
+        plt.figure(figsize=(14, 8))
+        
+        # Extract data for plotting
+        models = []
+        mean_ranks = []
+        rank_ranges = []
+        
+        for model_name, metrics in sorted(model_stability.items(), 
+                                        key=lambda x: x[1]['mean_rank']):
+            models.append(f"{metrics['embedding']}\n{metrics['classifier']}")
+            mean_ranks.append(metrics['mean_rank'])
+            rank_ranges.append(metrics['rank_range'])
+        
+        # Plot mean ranks
+        x = np.arange(len(models))
+        plt.bar(x, mean_ranks, width=0.6, yerr=rank_ranges, 
+                capsize=5, color='lightblue', label='Mean Rank')
+        
+        # Add labels and formatting
+        plt.axhline(y=3.5, color='r', linestyle='--', 
+                label='Top 3 Threshold')
+        plt.xlabel('Model')
+        plt.ylabel('Rank (lower is better)')
+        plt.title('Model Rank Stability Across Datasets')
+        plt.xticks(x, models, rotation=45, ha='right')
+        plt.legend()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        # Save figure
+        plt.savefig(os.path.join(self.output_dir, 'model_rank_stability.png'), dpi=300)
+        plt.close()
+        
+        # 2. Rank distribution plot (box plot)
+        plt.figure(figsize=(14, 8))
+        
+        # Prepare data for box plot
+        boxplot_data = []
+        boxplot_labels = []
+        
+        for model_name, metrics in sorted(model_stability.items(), 
+                                        key=lambda x: x[1]['mean_rank']):
+            if len(metrics['ranks']) >= 2:  # Need at least 2 points for a box
+                boxplot_data.append(metrics['ranks'])
+                boxplot_labels.append(f"{metrics['embedding']}\n{metrics['classifier']}")
+        
+        # Create box plot
+        plt.boxplot(boxplot_data, labels=boxplot_labels, vert=True)
+        plt.axhline(y=3.5, color='r', linestyle='--', 
+                label='Top 3 Threshold')
+        plt.ylabel('Rank (lower is better)')
+        plt.title('Rank Distribution Across Datasets')
+        plt.xticks(rotation=45, ha='right')
+        plt.legend()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        
+        # Save figure
+        plt.savefig(os.path.join(self.output_dir, 'rank_distribution.png'), dpi=300)
+        plt.close()
+
+    def add_rank_stability_section(self, model_stability):
+        """
+        Add rank stability analysis to the report
+        
+        Args:
+            model_stability: Dictionary with rank stability metrics
+        """
+        report_path = os.path.join(self.output_dir, 'ablation_report.html')
+        
+        # Check if report exists
+        if not os.path.exists(report_path):
+            print("Error: Report not found. Generate full report first.")
+            return
+        
+        # Read existing report
+        with open(report_path, 'r') as f:
+            report_content = f.read()
+        
+        # Create rank stability section
+        rank_section = '<h2>Model Rank Stability Analysis</h2>'
+        rank_section += '<p>This section analyzes how consistently each model combination ranks across different datasets.</p>'
+        
+        # Rank stability table
+        rank_section += '<h3>Model Rank Stability Metrics</h3>'
+        rank_section += '<p>Lower mean rank and rank range indicate better and more consistent performance.</p>'
+        rank_section += '<table><tr><th>Embedding</th><th>Classifier</th><th>Mean Rank</th>'
+        rank_section += '<th>Median Rank</th><th>Rank Range</th><th>Std Dev</th>'
+        rank_section += '<th>Consistently in Top 3</th><th>Datasets Count</th></tr>'
+        
+        # Sort by mean rank (best performers first)
+        for model, metrics in sorted(model_stability.items(), 
+                                key=lambda x: x[1]['mean_rank']):
+            top_3 = "Yes" if metrics['consistent_top_3'] else "No"
+            rank_section += f'''<tr>
+                <td>{metrics['embedding']}</td>
+                <td>{metrics['classifier']}</td>
+                <td>{metrics['mean_rank']:.2f}</td>
+                <td>{metrics['median_rank']:.1f}</td>
+                <td>{metrics['rank_range']:.1f}</td>
+                <td>{metrics['std_rank']:.2f}</td>
+                <td>{top_3}</td>
+                <td>{metrics['datasets_count']}</td>
+            </tr>'''
+        
+        rank_section += '</table>'
+        
+        # Add rank details table
+        rank_section += '<h3>Detailed Rank Positions by Dataset</h3>'
+        rank_section += '<table><tr><th>Embedding</th><th>Classifier</th>'
+        
+        # Get all dataset names from the first model
+        first_model = next(iter(model_stability.values()))
+        datasets = first_model['datasets']
+        
+        # Add dataset columns
+        for dataset in datasets:
+            rank_section += f'<th>{dataset}</th>'
+        
+        rank_section += '</tr>'
+        
+        # Add each model's rank in each dataset
+        for model, metrics in sorted(model_stability.items(), 
+                                key=lambda x: x[1]['mean_rank']):
+            rank_section += f'''<tr>
+                <td>{metrics['embedding']}</td>
+                <td>{metrics['classifier']}</td>'''
+            
+            # Create a mapping of dataset to rank
+            dataset_to_rank = dict(zip(metrics['datasets'], metrics['ranks']))
+            
+            # Add each dataset's rank
+            for dataset in datasets:
+                if dataset in dataset_to_rank:
+                    rank = dataset_to_rank[dataset]
+                    # Highlight top 3 ranks
+                    if rank <= 3:
+                        rank_section += f'<td style="background-color:#d4edda"><strong>{rank}</strong></td>'
+                    else:
+                        rank_section += f'<td>{rank}</td>'
+                else:
+                    rank_section += '<td>-</td>'
+            
+            rank_section += '</tr>'
+        
+        rank_section += '</table>'
+        
+        # Rank visualizations
+        rank_section += '<h3>Rank Stability Visualizations</h3>'
+        rank_section += '<div style="display:flex;flex-wrap:wrap;justify-content:space-between">'
+        rank_section += '<div style="flex:1;min-width:45%;margin:10px"><img src="model_rank_stability.png" alt="Model Rank Stability"/></div>'
+        rank_section += '<div style="flex:1;min-width:45%;margin:10px"><img src="rank_distribution.png" alt="Rank Distribution"/></div>'
+        rank_section += '</div>'
+        
+        # Insert before conclusion
+        consistency_heading = '<h2>Model Consistency Analysis</h2>'
+        conclusion_heading = '<h2>Conclusion and Recommendations</h2>'
+        
+        if consistency_heading in report_content:
+            # Insert after consistency section
+            new_report = report_content.replace(conclusion_heading, 
+                                            rank_section + conclusion_heading)
+        else:
+            # Insert before conclusion if no consistency section
+            new_report = report_content.replace(conclusion_heading, 
+                                            rank_section + conclusion_heading)
+        
+        # Write updated report
+        with open(report_path, 'w') as f:
+            f.write(new_report)

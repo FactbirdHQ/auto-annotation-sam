@@ -425,9 +425,7 @@ class Classifier:
         # Ensure everything is a list for consistent processing
         if not isinstance(images, list):
             images = [images]
-        if not isinstance(masks, list):
             masks = [masks]
-        if not isinstance(labels, list):
             labels = [labels]
         
         # Process each image and its masks
