@@ -17,9 +17,20 @@ class SegmentationReportGenerator:
     def generate_full_report(self, all_results, dataset_managers):
         """
         Generate a comprehensive HTML report
+        
+        Args:
+            all_results: Dictionary with all the ablation results
+            dataset_managers: Dictionary of dataset manager objects
         """
+        # Extract per_dataset results - handle both direct and nested structure
+        per_dataset_results = {}
+        if 'per_dataset' in all_results:
+            per_dataset_results = all_results['per_dataset']
+        elif 'ablation' in all_results and 'per_dataset' in all_results['ablation']:
+            per_dataset_results = all_results['ablation']['per_dataset']
+        
         # Create a summary DataFrame for per-dataset results
-        df = self._create_summary_dataframe(all_results['per_dataset'])
+        df = self._create_summary_dataframe(per_dataset_results)
         
         # Save to CSV
         df.to_csv(os.path.join(self.output_dir, 'ablation_summary.csv'), index=False)
@@ -29,8 +40,56 @@ class SegmentationReportGenerator:
         self._plot_f1_by_dataset(df)
         self._plot_timing_metrics(df)
         
-        # Generate HTML report
+        # Generate HTML report base
         self._generate_html_report(all_results, df, dataset_managers)
+        
+        # Prepare data structure for additional sections
+        report_data = {}
+        
+        # Extract training size data
+        if 'training_size' in all_results:
+            report_data['training_size'] = all_results['training_size']
+        elif 'ablation' in all_results and 'training_size' in all_results['ablation']:
+            report_data['training_size'] = all_results['ablation']['training_size']
+        
+        # Extract per_dataset for reference in training size section
+        if 'per_dataset' in all_results:
+            report_data['per_dataset'] = all_results['per_dataset']
+        elif 'ablation' in all_results and 'per_dataset' in all_results['ablation']:
+            report_data['per_dataset'] = all_results['ablation']['per_dataset']
+        
+        # Add training size analysis if available
+        if 'training_size' in report_data:
+            with open(os.path.join(self.output_dir, 'ablation_report.html'), 'a') as f:
+                self._add_training_size_section(f, report_data)
+        
+        # Extract consistency results
+        consistency_results = None
+        if 'consistency' in all_results:
+            consistency_results = all_results['consistency']
+        elif 'ablation' in all_results and 'consistency' in all_results['ablation']:
+            consistency_results = all_results['ablation']['consistency']
+        
+        # Add consistency section if available
+        if consistency_results:
+            self.plot_consistency_metrics(consistency_results)
+            self.add_consistency_section(consistency_results)
+        
+        # Extract pipeline comparison results
+        pipeline_comparison = None
+        if 'pipeline_comparison' in all_results:
+            pipeline_comparison = all_results['pipeline_comparison']
+        elif 'comparison' in all_results:
+            pipeline_comparison = all_results['comparison']
+        
+        # Add pipeline comparison if available
+        if pipeline_comparison:
+            # Extract ideal and realistic results
+            ideal_results = pipeline_comparison.get('ideal', {})
+            realistic_results = pipeline_comparison.get('realistic', {})
+            
+            if ideal_results and realistic_results:
+                self.add_pipeline_comparison(ideal_results, realistic_results)
         
         return df
     

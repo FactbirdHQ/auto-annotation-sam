@@ -10,7 +10,7 @@ TODO:
     [X] Delete conclusion
     [X] Add Track 2 analysis, what part is SAMs fault.
 [X] Implement a second track mode in data loader
-[ ] Implement safeguard for training size analysis not to train on images without class examples (maybe even max them out)
-[ ] Double check model hyperparameters (like lasso for LogReg)
-[ ] Fix study run order
-    [ ] Second track
+[X] Implement safeguard for training size analysis not to train on images without class examples (maybe even max them out)
+[X] Double check model hyperparameters (like lasso for LogReg)
+[X] Fix study run order
+    [X] Second track

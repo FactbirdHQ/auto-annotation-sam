@@ -83,6 +83,81 @@ class AblationStudy:
         
         return self.dataset_managers
     
+    def _evaluate_model(self, model, train_data, val_data, return_predictions=False):
+        """
+        Core model evaluation logic used across different analysis methods
+        
+        Args:
+            model: Model to train and evaluate
+            train_data: Tuple of (train_images, train_masks, train_labels)
+            val_data: Tuple of (val_prediction_data, val_gt_masks)
+            return_predictions: Whether to return prediction masks and probabilities
+            
+        Returns:
+            Dictionary with evaluation metrics and timing information,
+            and optionally the prediction masks and probabilities
+        """
+        train_images, train_masks, train_labels = train_data
+        val_prediction_data, val_gt_masks = val_data
+        
+        # Time the training process
+        start_time = time.perf_counter()
+        model.fit(train_images, train_masks, train_labels)
+        train_time = time.perf_counter() - start_time
+        
+        # Collect predictions
+        val_pred_masks = []
+        val_pred_probs = []
+        
+        # Time the inference process
+        total_inference_time = 0
+        num_predictions = 0
+        
+        # Process each validation sample
+        for image, candidate_masks in val_prediction_data:
+            if candidate_masks:
+                # Time the prediction process for this sample
+                start_time = time.perf_counter()
+                pred_results, probs = model.predict(image, candidate_masks)
+                inference_time = time.perf_counter() - start_time
+                total_inference_time += inference_time
+                num_predictions += 1
+                
+                for (mask, pred_class), prob in zip(pred_results, probs):
+                    # Only keep masks predicted as positive (class 1)
+                    if pred_class == 1:
+                        val_pred_masks.append(mask)
+                        val_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
+        
+        # Calculate average inference time
+        avg_inference_time = total_inference_time / max(1, num_predictions)
+        
+        # Sort masks by probability
+        if val_pred_masks and val_pred_probs:
+            val_pred_masks, val_pred_probs = self._sort_by_probability(val_pred_masks, val_pred_probs)
+        
+        # Evaluate predictions
+        metrics = None
+        if val_gt_masks and val_pred_masks:
+            metrics = evaluate_binary_masks(val_gt_masks, val_pred_masks)
+            metrics['training_time'] = train_time
+            metrics['inference_time'] = avg_inference_time
+        else:
+            # Return empty metrics if no predictions
+            metrics = {
+                'mask_precision': 0, 
+                'mask_recall': 0,
+                'mask_f1': 0,
+                'training_time': train_time,
+                'inference_time': avg_inference_time
+            }
+        
+        if return_predictions:
+            return metrics, val_pred_masks, val_pred_probs
+        else:
+            return metrics
+
+    
     def create_model(self, embedding_name, classifier_name, embedding_config=None, classifier_config=None):
         """
         Create model with specified embedding and classifier
@@ -111,8 +186,272 @@ class AblationStudy:
         
         return classifier
     
+    def _create_and_evaluate_model(self, dataset_name, embedding_name, classifier_name, 
+                              embedding_config=None, classifier_config=None,
+                              train_loader=None, val_loader=None):
+        """
+        Create, train and evaluate a model with specified configuration
+        
+        Args:
+            dataset_name: Name of the dataset
+            embedding_name: Name of the embedding
+            classifier_name: Name of the classifier
+            embedding_config: Configuration for the embedding
+            classifier_config: Configuration for the classifier
+            train_loader: DataLoader for training data (if None, uses first fold)
+            val_loader: DataLoader for validation data (if None, uses first fold)
+            
+        Returns:
+            Tuple of (metrics, model) where metrics is a dictionary with evaluation results
+            and model is the trained model
+        """
+        # Get dataset manager
+        if dataset_name not in self.dataset_managers:
+            raise ValueError(f"Dataset {dataset_name} not loaded")
+        
+        dataset_manager = self.dataset_managers[dataset_name]
+        
+        # Get data loaders if not provided
+        if train_loader is None or val_loader is None:
+            fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
+            train_loader, val_loader = fold_dataloaders[0]
+        
+        # Get training and validation data
+        train_images, train_masks, train_labels = dataset_manager.get_training_data(train_loader)
+        val_prediction_data = dataset_manager.get_prediction_data(val_loader)
+        
+        # Get ground truth masks for validation
+        val_gt_masks = []
+        for batch in val_loader:
+            batch_gt_masks = batch['gt_binary_mask']
+            batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
+            
+            for i, has_gt in enumerate(batch_has_gt):
+                if has_gt:
+                    gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
+                    val_gt_masks.append(gt_mask)
+        
+        # Create and evaluate model
+        model = None
+        metrics = None
+        try:
+            model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
+            
+            # Evaluate model
+            metrics = self._evaluate_model(model, 
+                                        (train_images, train_masks, train_labels),
+                                        (val_prediction_data, val_gt_masks))
+            
+            return metrics, model
+        except Exception as e:
+            print(f"Error evaluating {embedding_name}-{classifier_name} on {dataset_name}: {e}")
+            if model is not None:
+                self._cleanup_model(model)
+            return None, None
+        
+    def _cleanup_model(self, model):
+        """Safely clean up model resources"""
+        try:
+            # Clean up any hooks if the embedding has a cleanup method
+            if model is not None and hasattr(model.embedding, 'cleanup'):
+                model.embedding.cleanup()
+            
+            # Delete model reference
+            del model
+            gc.collect()
+        except Exception as e:
+            print(f"Error cleaning up model: {e}")
+    
+    def _save_to_json(self, data, filename):
+        """
+        Save data to JSON file with proper serialization of numpy types
+        
+        Args:
+            data: Data to serialize
+            filename: Path to save the JSON file
+        """
+        # Ensure path exists
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
+        # Convert numpy values to Python native types
+        def numpy_converter(obj):
+            if isinstance(obj, (np.integer, np.floating)):
+                return obj.item()
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
+        
+        # Save to file
+        with open(filename, 'w') as f:
+            json.dump(data, f, default=numpy_converter, indent=4)
+
+    def _get_train_val_data(self, dataset_name, fold_idx=0, return_combined = False):
+        """
+        Get training and validation data for a specific dataset and fold
+        
+        Args:
+            dataset_name: Name of the dataset
+            fold_idx: Index of the fold to use
+            
+        Returns:
+            Tuple of (train_data, val_data) where
+            train_data is (train_images, train_masks, train_labels) and
+            val_data is (val_prediction_data, val_gt_masks)
+        """
+        if dataset_name not in self.dataset_managers:
+            raise ValueError(f"Dataset {dataset_name} not loaded")
+        
+        dataset_manager = self.dataset_managers[dataset_name]
+        
+        # Get k-fold data loaders
+        fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
+        if fold_idx >= len(fold_dataloaders):
+            raise ValueError(f"Fold {fold_idx} is out of range for dataset {dataset_name} with {len(fold_dataloaders)} folds")
+        
+        train_loader, val_loader = fold_dataloaders[fold_idx]
+        
+        # Get training data
+        train_images, train_masks, train_labels = dataset_manager.get_training_data(train_loader)
+        
+        # Get validation data
+        val_prediction_data = dataset_manager.get_prediction_data(val_loader, return_combined)
+        
+        # Get ground truth masks for validation
+        val_gt_masks = []
+        for batch in val_loader:
+            batch_gt_masks = batch['gt_binary_mask']
+            batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
+            
+            for i, has_gt in enumerate(batch_has_gt):
+                if has_gt:
+                    gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
+                    val_gt_masks.append(gt_mask)
+        
+        return (train_images, train_masks, train_labels), (val_prediction_data, val_gt_masks)
+    
+    def run_pipeline_comparison(self):
+        """
+        Compare performance between ideal (full recall) and realistic (SAM2-based) pipelines.
+        - Reuses existing cross-validation results for the realistic track
+        - Reuses existing best configurations from hyperparameter tuning
+        - Only runs the ideal track with GT + SAM masks as candidates
+        
+        Returns:
+            Dictionary with comparison results between ideal and realistic pipelines
+        """
+        # Ensure we have all_results with best_configs and per_dataset results
+        if not hasattr(self, 'all_results'):
+            raise ValueError("No ablation results found. Run full ablation study first.")
+        
+        if 'best_configs' not in self.all_results:
+            raise ValueError("No best configurations found. Run hyperparameter tuning first.")
+        
+        if 'per_dataset' not in self.all_results:
+            raise ValueError("No cross-validation results found. Run full ablation study first.")
+        
+        # Get the best configurations and realistic results
+        best_configs = self.all_results['best_configs']
+        realistic_results = self.all_results['per_dataset']
+        
+        # Initialize results structure for ideal track
+        ideal_results = {}
+        
+        print("\n" + "="*80)
+        print("Running Pipeline Comparison: Ideal vs. Realistic")
+        print("="*80)
+        print("Using existing cross-validation results for realistic track")
+        print("Using existing best configurations from hyperparameter tuning")
+        
+        # Process datasets
+        for dataset_name, dataset_dict in realistic_results.items():
+            if dataset_name not in self.dataset_managers:
+                print(f"Warning: Dataset {dataset_name} not loaded. Skipping.")
+                continue
+                
+            ideal_results[dataset_name] = {}
+            dataset_manager = self.dataset_managers[dataset_name]
+            
+            # Get k-fold data loaders for this dataset
+            fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
+            
+            for embedding_name, embedding_dict in dataset_dict.items():
+                ideal_results[dataset_name][embedding_name] = {}
+                
+                for classifier_name, _ in embedding_dict.items():
+                    # Check if we have best configs for this combination
+                    if (dataset_name not in best_configs or
+                        embedding_name not in best_configs[dataset_name] or
+                        classifier_name not in best_configs[dataset_name][embedding_name]):
+                        print(f"Skipping {dataset_name}, {embedding_name}, {classifier_name} - no best config")
+                        continue
+                    
+                    print(f"\nProcessing {dataset_name}, {embedding_name}, {classifier_name}")
+                    
+                    # Get best configs
+                    best_config = best_configs[dataset_name][embedding_name][classifier_name]
+                    embedding_config = best_config.get('embedding', {})
+                    classifier_config = best_config.get('classifier', {})
+                    
+                    # Track metrics across all folds
+                    fold_metrics = []
+                    
+                    # Process each fold (skipping fold 0, which is for hyperparameter tuning)
+                    for fold_idx in range(1, self.k_folds):
+                        print(f"  Processing fold {fold_idx}/{self.k_folds-1}")
+                        
+                        # Get training and validation data for this fold, with return_combined=True for ideal track
+                        train_data, val_data = self._get_train_val_data(
+                            dataset_name, fold_idx, return_combined=True
+                        )
+                        
+                        train_images, train_masks, train_labels = train_data
+                        val_prediction_data, val_gt_masks = val_data
+                        
+                        if not train_images:
+                            print(f"  No training data for fold {fold_idx}")
+                            continue
+                        
+                        # Create and evaluate model
+                        model = None
+                        try:
+                            model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
+                            
+                            # Evaluate model
+                            metrics = self._evaluate_model(
+                                model,
+                                (train_images, train_masks, train_labels),
+                                (val_prediction_data, val_gt_masks)
+                            )
+                            
+                            # Add fold index to metrics
+                            metrics['fold'] = fold_idx
+                            fold_metrics.append(metrics)
+                            
+                        except Exception as e:
+                            print(f"  Error evaluating {embedding_name}-{classifier_name} on fold {fold_idx}: {e}")
+                            continue
+                        finally:
+                            # Clean up model
+                            self._cleanup_model(model)
+                    
+                    # Aggregate metrics across folds
+                    if fold_metrics:
+                        aggregated_metrics = self._aggregate_fold_metrics(fold_metrics)
+                        ideal_results[dataset_name][embedding_name][classifier_name] = aggregated_metrics
+        
+        # Save results
+        comparison_results = {
+            'ideal': ideal_results,
+            'realistic': realistic_results
+        }
+        
+        self._save_to_json(comparison_results, os.path.join(self.output_dir, 'pipeline_comparison_results.json'))
+        
+        return comparison_results
+    
     def perform_cross_validation(self, dataset_name, embedding_name, classifier_name, 
-                        embedding_config=None, classifier_config=None):
+                    embedding_config=None, classifier_config=None):
         """
         Perform k-fold cross-validation for a specific dataset, embedding, and classifier
         """
@@ -133,105 +472,52 @@ class AblationStudy:
                                                         total=self.k_folds, 
                                                         desc=f"CV {embedding_name}-{classifier_name}"):
             if fold_idx == 0:
-                continue
-            
+                continue  # Skip fold 0 (reserved for hyperparameter tuning)
+                
             print(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
             
             # Create model for this fold
             model = None
             try:
-                model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
-                
-                # Extract training data
-                train_images, train_masks, train_labels = dataset_manager.get_training_data(train_loader)
+                # Get training and validation data
+                train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
+                train_images, train_masks, train_labels = train_data
+                val_prediction_data, val_gt_masks = val_data
                 
                 if not train_images:
                     print(f"No training data for fold {fold_idx+1}")
                     continue
-                
-                # Time the training process
-                start_time = time.perf_counter()
-                model.fit(train_images, train_masks, train_labels)
-                train_time = time.perf_counter() - start_time
-                training_times.append(train_time)
-                print(f"Training completed in {train_time:.2f} seconds")
-                
-                # Get validation data
-                val_prediction_data = dataset_manager.get_prediction_data(val_loader)
-                
+                    
                 if not val_prediction_data:
                     print(f"No validation data for fold {fold_idx+1}")
                     continue
-                
-                # Collect ground truth masks for validation
-                val_gt_masks = []
-                val_pred_masks = []
-                val_pred_probs = []
-                
-                # Time the inference process
-                total_inference_time = 0
-                num_predictions = 0
-                
-                # Process each validation sample
-                for val_idx, (image, candidate_masks) in enumerate(val_prediction_data):
-                    # Get ground truth masks (get them from the validation loader)
-                    for batch in val_loader:
-                        batch_images = batch['image']
-                        batch_gt_masks = batch['gt_binary_mask']
-                        batch_filenames = batch['filename']
-                        
-                        for i, filename in enumerate(batch_filenames):
-                            if i == val_idx:  # Simple matching for this example
-                                gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
-                                val_gt_masks.append(gt_mask)
-                                break
                     
-                    # Time the prediction process for this sample
-                    if candidate_masks:
-                        start_time = time.perf_counter()
-                        pred_results, probs = model.predict(image, candidate_masks)
-                        inference_time = time.perf_counter() - start_time
-                        total_inference_time += inference_time
-                        num_predictions += 1
-                        
-                        for (mask, pred_class), prob in zip(pred_results, probs):
-                            # Only keep masks predicted as positive (class 1)
-                            if pred_class == 1:
-                                val_pred_masks.append(mask)
-                                val_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
+                # Create and evaluate model
+                model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
                 
-                # Calculate average inference time
-                avg_inference_time = total_inference_time / max(1, num_predictions)
-                inference_times.append(avg_inference_time)
-                print(f"Average inference time per sample: {avg_inference_time:.4f} seconds")
+                # Evaluate model using the helper method
+                metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
+                    model,
+                    (train_images, train_masks, train_labels),
+                    (val_prediction_data, val_gt_masks),
+                    return_predictions=True
+                )
                 
-                # Sort masks by probability
-                if val_pred_masks and val_pred_probs:
-                    val_pred_masks, val_pred_probs = self._sort_by_probability(val_pred_masks, val_pred_probs)
+                # Add fold index to metrics
+                metrics['fold'] = fold_idx
+                fold_metrics.append(metrics)
                 
-                # Evaluate predictions
-                if val_gt_masks and val_pred_masks:
-                    metrics = evaluate_binary_masks(val_gt_masks, val_pred_masks)
-                    metrics['fold'] = fold_idx
-                    metrics['training_time'] = train_time
-                    metrics['inference_time'] = avg_inference_time
-                    fold_metrics.append(metrics)
+                # Track timing metrics
+                training_times.append(metrics['training_time'])
+                inference_times.append(metrics['inference_time'])
+                
+                # Save precision-recall curve for this fold
+                self._save_pr_curve(val_gt_masks, val_pred_masks, val_pred_probs, 
+                                dataset_name, embedding_name, classifier_name, fold_idx)
                     
-                    # Save precision-recall curve for this fold
-                    self._save_pr_curve(val_gt_masks, val_pred_masks, val_pred_probs, 
-                                    dataset_name, embedding_name, classifier_name, fold_idx)
-                else:
-                    print(f"No ground truth or predicted masks for evaluation in fold {fold_idx+1}")
             finally:
-                # Clean up resources even if an exception occurred
-                if model is not None:
-                    # Clean up any hooks if the embedding has a cleanup method
-                    if hasattr(model.embedding, 'cleanup'):
-                        model.embedding.cleanup()
-                    
-                    # Delete model and force garbage collection
-                    del model
-                    gc.collect()
+                # Use dedicated cleanup helper
+                self._cleanup_model(model)
         
         # Aggregate metrics across folds
         if fold_metrics:
@@ -357,33 +643,14 @@ class AblationStudy:
         
         # Save results to JSON
         output_path = os.path.join(self.output_dir, 'model_consistency_analysis.json')
-        with open(output_path, 'w') as f:
-            # Convert numpy values to native Python types
-            serializable_results = json.loads(
-                json.dumps(consistency_results, default=lambda x: x.item() if isinstance(x, (np.integer, np.floating)) else x)
-            )
-            json.dump(serializable_results, f, indent=4)
+        self._save_to_json(consistency_results, output_path)
         
         return consistency_results
     
     def hyperparameter_grid_search(self, dataset_name, embedding_name, classifier_name, grid_config):
         """
         Perform grid search over hyperparameters for a specific dataset, embedding, and classifier
-        
-        Args:
-            dataset_name: Name of the dataset
-            embedding_name: Name of the embedding
-            classifier_name: Name of the classifier
-            grid_config: Dictionary with parameter grids for embedding and classifier
-        
-        Returns:
-            Best configuration based on average F1 score
         """
-        if dataset_name not in self.dataset_managers:
-            raise ValueError(f"Dataset {dataset_name} not loaded")
-        
-        dataset_manager = self.dataset_managers[dataset_name]
-        
         # Get parameter grids
         embedding_grid = grid_config.get(embedding_name, {})
         classifier_grid = grid_config.get(classifier_name, {})
@@ -405,91 +672,42 @@ class AblationStudy:
         best_f1 = -1
         all_results = []
         
-        # Split dataset for grid search (use first fold for simplicity)
-        fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
-        train_loader, val_loader = fold_dataloaders[0]
-        
-        # Get training and validation data
-        train_images, train_masks, train_labels = dataset_manager.get_training_data(train_loader)
-        val_prediction_data = dataset_manager.get_prediction_data(val_loader)
-        
-        # Get ground truth masks for validation
-        val_gt_masks = []
-        for batch in val_loader:
-            batch_gt_masks = batch['gt_binary_mask']
-            batch_has_gt = batch['has_gt']
-            
-            for i, has_gt in enumerate(batch_has_gt):
-                if has_gt:
-                    gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
-                    val_gt_masks.append(gt_mask)
-
         # Create tqdm progress bar for the grid search
         with tqdm(total=total_configs, desc=f"Grid search {embedding_name}-{classifier_name}") as pbar:
             # Try each combination of parameters
             for emb_config in embedding_param_grid:
                 for cls_config in classifier_param_grid:
-                    # Create model with current configuration
-                    model = None
-                    try:
-                        model = self.create_model(embedding_name, classifier_name, emb_config, cls_config)
+                    metrics, model = self._create_and_evaluate_model(
+                        dataset_name, embedding_name, classifier_name,
+                        emb_config, cls_config
+                    )
+                    
+                    # Clean up model regardless of result
+                    if model is not None:
+                        self._cleanup_model(model)
+                    
+                    # Save results if evaluation was successful
+                    if metrics is not None:
+                        result = {
+                            'embedding_config': emb_config,
+                            'classifier_config': cls_config,
+                            'metrics': metrics
+                        }
+                        all_results.append(result)
                         
-                        # Train model
-                        model.fit(train_images, train_masks, train_labels)
-                        
-                        # Collect predictions
-                        val_pred_masks = []
-                        val_pred_probs = []
-                        
-                        for image, candidate_masks in val_prediction_data:
-                            if candidate_masks:
-                                pred_results, probs = model.predict(image, candidate_masks)
-                                
-                                for (mask, pred_class), prob in zip(pred_results, probs):
-                                    if pred_class == 1:
-                                        val_pred_masks.append(mask)
-                                        val_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
-                        
-                        # Evaluate predictions
-                        if val_pred_masks:
-                            metrics = evaluate_binary_masks(val_gt_masks, val_pred_masks)
-                            
-                            # Save results
-                            result = {
-                                'embedding_config': emb_config,
-                                'classifier_config': cls_config,
+                        # Update best configuration if better F1 score
+                        if metrics['mask_f1'] > best_f1:
+                            best_f1 = metrics['mask_f1']
+                            best_config = {
+                                'embedding': emb_config,
+                                'classifier': cls_config,
                                 'metrics': metrics
                             }
-                            all_results.append(result)
-                            
-                            # Update best configuration if better F1 score
-                            if metrics['mask_f1'] > best_f1:
-                                best_f1 = metrics['mask_f1']
-                                best_config = {
-                                    'embedding': emb_config,
-                                    'classifier': cls_config,
-                                    'metrics': metrics
-                                }
-                                
-                                # Update progress bar with best F1 score
-                                pbar.set_postfix({"Best F1": f"{best_f1:.4f}"})
-                                
-                    except Exception as e:
-                        print(f"\nError with config - embedding: {emb_config}, classifier: {cls_config}")
-                        print(f"Error: {e}")
-                    finally:
-                        # Clean up resources even if an exception occurred
-                        if model is not None:
-                            # Clean up any hooks if the embedding has a cleanup method
-                            if hasattr(model.embedding, 'cleanup'):
-                                model.embedding.cleanup()
-                            
-                            # Delete model and force garbage collection
-                            del model
-                            gc.collect()
-                        
-                        # Update progress bar
-                        pbar.update(1)
+                            # Update progress bar with best F1 score
+                            pbar.set_postfix({"Best F1": f"{best_f1:.4f}"})
+                    
+                    # Update progress bar
+                    pbar.update(1)
         
         # Save all grid search results
         self._save_grid_search_results(dataset_name, embedding_name, classifier_name, all_results)
@@ -497,29 +715,20 @@ class AblationStudy:
         return best_config
     
     def perform_training_size_analysis(self, dataset_name, embedding_name, classifier_name, 
-                              embedding_config=None, classifier_config=None,
-                              training_sizes=[1, 2, 3, 5, 10]):
+                      embedding_config=None, classifier_config=None,
+                      training_sizes=None):
         """
-        Perform analysis of how model performance scales with training set size
-        
-        Args:
-            dataset_name: Name of the dataset
-            embedding_name: Name of the embedding
-            classifier_name: Name of the classifier
-            embedding_config: Configuration for the embedding
-            classifier_config: Configuration for the classifier
-            training_sizes: List of training set sizes to evaluate
-            
-        Returns:
-            Dictionary of evaluation metrics for each training size
+        Perform analysis of how model performance scales with training set size,
+        prioritizing images with the most ground truth masks
         """
+        training_sizes = training_sizes or [1, 2, 3, 5, 10]
         
         if dataset_name not in self.dataset_managers:
             raise ValueError(f"Dataset {dataset_name} not loaded")
         
         dataset_manager = self.dataset_managers[dataset_name]
         
-        # Get k-fold data loaders
+        # Get k-fold data loaders 
         fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
         
         # Track metrics across all folds and training sizes
@@ -537,49 +746,62 @@ class AblationStudy:
         
         # Create progress bar for overall progress
         with tqdm(total=total_iterations, desc=f"Training size analysis {embedding_name}-{classifier_name}") as pbar:
-            # For each fold (except one reserved for hyperparameter tuning)
+            # For each fold (except fold 0 reserved for hyperparameter tuning)
             for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders[1:], 1):
                 print(f"\nProcessing fold {fold_idx}/{self.k_folds}")
                 
-                # Extract all training data from this fold
-                all_train_images, all_train_masks, all_train_labels = dataset_manager.get_training_data(train_loader)
+                # Get all training and validation data
+                train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
+                all_train_images, all_train_masks, all_train_labels = train_data
+                val_prediction_data, val_gt_masks = val_data
                 
                 if not all_train_images:
                     print(f"No training data for fold {fold_idx}")
                     continue
                 
-                # Get validation data
-                val_prediction_data = dataset_manager.get_prediction_data(val_loader)
-                val_gt_masks = []
+                # Calculate information content (number of GT masks) for each training image
+                image_info_scores = []
+                for i, masks in enumerate(all_train_masks):
+                    # Count the number of ground truth masks (where label is 1)
+                    gt_mask_count = sum(1 for j, label in enumerate(all_train_labels[i]) 
+                                        if label == 1)
+                    image_info_scores.append((i, gt_mask_count))
                 
-                # Extract ground truth masks for validation
-                for batch in val_loader:
-                    batch_gt_masks = batch['gt_binary_mask']
-                    batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
-                    
-                    for i, has_gt in enumerate(batch_has_gt):
-                        if has_gt:
-                            gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
-                            val_gt_masks.append(gt_mask)
+                # Sort by information content (highest number of GT masks first)
+                image_info_scores.sort(key=lambda x: x[1], reverse=True)
+                sorted_indices = [item[0] for item in image_info_scores]
                 
                 # For each training size
                 for train_size in training_sizes:
                     if train_size > len(all_train_images):
                         print(f"Training size {train_size} exceeds available data ({len(all_train_images)})")
                         continue
-                        
+                    
                     # Create multiple subsets for each training size
                     num_subsets = min(5, len(all_train_images) // train_size)
                     subset_metrics = []
                     
                     for subset_idx in range(num_subsets):
-                        # Create random subset of specified size
-                        indices = np.random.choice(len(all_train_images), train_size, replace=False)
+                        # For the first subset, always use the most informative images
+                        if subset_idx == 0:
+                            # Take the top train_size most informative images
+                            indices = sorted_indices[:train_size]
+                        else:
+                            # For additional subsets, select randomly from remaining images
+                            available_indices = list(set(range(len(all_train_images))) - set(sorted_indices[:train_size]))
+                            if len(available_indices) < train_size:
+                                # If not enough remaining images, use random sampling with replacement
+                                indices = np.random.choice(range(len(all_train_images)), train_size, replace=True)
+                            else:
+                                # Otherwise, sample without replacement from remaining images
+                                indices = np.random.choice(available_indices, train_size, replace=False)
+                        
+                        # Create the subset
                         subset_images = [all_train_images[i] for i in indices]
                         subset_masks = [all_train_masks[i] for i in indices]
                         subset_labels = [all_train_labels[i] for i in indices]
                         
-                        # Create and train model on this subset
+                        # Create model
                         model = None
                         try:
                             model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
@@ -587,58 +809,37 @@ class AblationStudy:
                             # Update progress bar description with current details
                             pbar.set_description(f"Size: {train_size} | Subset: {subset_idx+1}/{num_subsets}")
                             
-                            # Train model
-                            model.fit(subset_images, subset_masks, subset_labels)
+                            # Evaluate model using the helper method
+                            metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
+                                model,
+                                (subset_images, subset_masks, subset_labels),
+                                (val_prediction_data, val_gt_masks),
+                                return_predictions=True
+                            )
                             
-                            # Evaluate on validation data
-                            val_pred_masks = []
-                            val_pred_probs = []
+                            # Add metadata
+                            metrics['fold'] = fold_idx
+                            metrics['subset'] = subset_idx
+                            metrics['train_size'] = train_size
+                            subset_metrics.append(metrics)
                             
-                            for image, candidate_masks in val_prediction_data:
-                                if candidate_masks:
-                                    pred_results, probs = model.predict(image, candidate_masks)
-                                    
-                                    for (mask, pred_class), prob in zip(pred_results, probs):
-                                        if pred_class == 1:
-                                            val_pred_masks.append(mask)
-                                            val_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
+                            # Update progress bar with F1 score
+                            pbar.set_postfix({"F1": f"{metrics.get('mask_f1', 0):.4f}"})
                             
-                            # Sort masks by probability
-                            if val_pred_masks and val_pred_probs:
-                                val_pred_masks, val_pred_probs = self._sort_by_probability(val_pred_masks, val_pred_probs)
-                            
-                            # Evaluate predictions
-                            if val_gt_masks and val_pred_masks:
-                                metrics = evaluate_binary_masks(val_gt_masks, val_pred_masks)
-                                metrics['fold'] = fold_idx
-                                metrics['subset'] = subset_idx
-                                metrics['train_size'] = train_size
-                                subset_metrics.append(metrics)
-                                
-                                # Update progress bar with F1 score
-                                pbar.set_postfix({"F1": f"{metrics['mask_f1']:.4f}"})
-                                
-                                # Save precision-recall curve for this fold and subset
-                                self._save_pr_curve(
-                                    val_gt_masks, val_pred_masks, val_pred_probs,
-                                    f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
-                                    f"{fold_idx}_{subset_idx}"
-                                )
+                            # Save precision-recall curve for this fold and subset
+                            self._save_pr_curve(
+                                val_gt_masks, val_pred_masks, val_pred_probs,
+                                f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
+                                f"{fold_idx}_{subset_idx}"
+                            )
                         finally:
-                            # Clean up resources even if an exception occurred
-                            if model is not None:
-                                # Clean up any hooks if the embedding has a cleanup method
-                                if hasattr(model.embedding, 'cleanup'):
-                                    model.embedding.cleanup()
-                                
-                                # Delete model and force garbage collection
-                                del model
-                                gc.collect()
+                            # Use dedicated cleanup helper
+                            self._cleanup_model(model)
                             
                             # Update progress bar
                             pbar.update(1)
                     
-                    # Aggregate metrics across subsets for this training size and fold
+                    # Aggregate metrics across subsets
                     if subset_metrics:
                         avg_metrics = self._aggregate_subset_metrics(subset_metrics)
                         avg_metrics['fold'] = fold_idx
@@ -692,20 +893,13 @@ class AblationStudy:
             f"{dataset_name}_{embedding_name}_{classifier_name}_training_size_metrics.json"
         )
         
-        # Convert to serializable format
+        # Convert to serializable format with training size keys as strings
         serializable_metrics = {}
         for train_size, metrics_dict in metrics.items():
-            serializable_metrics[str(train_size)] = {}
-            for key, value in metrics_dict.items():
-                if isinstance(value, (np.integer, np.floating)):
-                    serializable_metrics[str(train_size)][key] = value.item()
-                elif isinstance(value, list) and value and isinstance(value[0], (np.integer, np.floating)):
-                    serializable_metrics[str(train_size)][key] = [v.item() for v in value]
-                else:
-                    serializable_metrics[str(train_size)][key] = value
+            serializable_metrics[str(train_size)] = metrics_dict
         
-        with open(output_path, 'w') as f:
-            json.dump(serializable_metrics, f, indent=4)
+        # Use the generic JSON saving helper
+        self._save_to_json(serializable_metrics, output_path)
 
     def _plot_learning_curve(self, dataset_name, embedding_name, classifier_name, metrics):
         """Plot learning curve showing how performance scales with training set size"""
@@ -764,8 +958,6 @@ class AblationStudy:
         training_size_results = {}
         best_configs = {}
         
-        # Create the report generator once
-        report_generator = SegmentationReportGenerator(self.output_dir)
         
         # Process one complete combination at a time
         for dataset_name in self.dataset_managers.keys():
@@ -837,24 +1029,26 @@ class AblationStudy:
             'best_configs': best_configs
         }
         
-        # Generate the full report
-        print("\nGenerating report...")
-        report_generator.generate_full_report(self.all_results, self.dataset_managers)
         
         # Analyze cross-dataset consistency
         print("\nAnalyzing cross-dataset consistency...")
         consistency_results = self.analyze_cross_dataset_consistency()
         
-        # Add consistency to the report
-        report_generator.plot_consistency_metrics(consistency_results)
-        report_generator.add_consistency_section(consistency_results)
+
+        # Run pipeline comparison
+        print("\nRunning pipeline comparison (ideal vs. realistic)...")
+        comparison_results = self.run_pipeline_comparison()
+        
+        # Update all_results to include comparison
+        all_results['pipeline_comparison'] = comparison_results
         
         # Complete results
         all_results = {
             'per_dataset': results,
             'training_size': training_size_results,
             'best_configs': best_configs,
-            'consistency': consistency_results
+            'consistency': consistency_results,
+            'pipeline_comparison': comparison_results
         }
         
         return all_results
@@ -941,19 +1135,7 @@ class AblationStudy:
             self.output_dir, 
             f"{dataset_name}_{embedding_name}_{classifier_name}_metrics.json"
         )
-        
-        # Convert numpy values to Python native types
-        serializable_metrics = {}
-        for key, value in metrics.items():
-            if isinstance(value, (np.integer, np.floating)):
-                serializable_metrics[key] = value.item()
-            elif isinstance(value, list) and value and isinstance(value[0], (np.integer, np.floating)):
-                serializable_metrics[key] = [v.item() for v in value]
-            else:
-                serializable_metrics[key] = value
-        
-        with open(output_path, 'w') as f:
-            json.dump(serializable_metrics, f, indent=4)
+        self._save_to_json(metrics, output_path)
 
     def _save_grid_search_results(self, dataset_name, embedding_name, classifier_name, results):
         """Save grid search results to a JSON file"""
@@ -961,28 +1143,8 @@ class AblationStudy:
             self.output_dir, 
             f"{dataset_name}_{embedding_name}_{classifier_name}_grid_search.json"
         )
-        
-        # Convert numpy values and make serializable
-        serializable_results = []
-        for result in results:
-            serializable_result = {
-                'embedding_config': {k: v for k, v in result['embedding_config'].items()},
-                'classifier_config': {k: v for k, v in result['classifier_config'].items()},
-                'metrics': {}
-            }
-            
-            for key, value in result['metrics'].items():
-                if isinstance(value, (np.integer, np.floating)):
-                    serializable_result['metrics'][key] = value.item()
-                elif isinstance(value, list) and value and isinstance(value[0], (np.integer, np.floating)):
-                    serializable_result['metrics'][key] = [v.item() for v in value]
-                else:
-                    serializable_result['metrics'][key] = value
-            
-            serializable_results.append(serializable_result)
-        
-        with open(output_path, 'w') as f:
-            json.dump(serializable_results, f, indent=4)
+        self._save_to_json(results, output_path)
+
     
     def _save_best_config(self, dataset_name, embedding_name, classifier_name, best_config):
         """Save best configuration to a JSON file"""
@@ -990,24 +1152,7 @@ class AblationStudy:
             self.output_dir, 
             f"{dataset_name}_{embedding_name}_{classifier_name}_best_config.json"
         )
-        
-        # Convert numpy values and make serializable
-        serializable_config = {
-            'embedding': {k: v for k, v in best_config['embedding'].items()},
-            'classifier': {k: v for k, v in best_config['classifier'].items()},
-            'metrics': {}
-        }
-        
-        for key, value in best_config['metrics'].items():
-            if isinstance(value, (np.integer, np.floating)):
-                serializable_config['metrics'][key] = value.item()
-            elif isinstance(value, list) and value and isinstance(value[0], (np.integer, np.floating)):
-                serializable_config['metrics'][key] = [v.item() for v in value]
-            else:
-                serializable_config['metrics'][key] = value
-        
-        with open(output_path, 'w') as f:
-            json.dump(serializable_config, f, indent=4)
+        self._save_to_json(best_config, output_path)
     
     def _save_pr_curve(self, gt_masks, pred_masks, pred_probs, dataset_name, embedding_name, classifier_name, fold_idx):
         """Save precision-recall curve for a specific fold"""
@@ -1055,7 +1200,7 @@ def create_default_config():
         'embeddings': ['CLIP', 'HOG', 'ResNet18'],
         'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
         'output_dir': './ablation_results',
-        'k_folds': 6,
+        'k_folds': 5,
         'hyperparameter_study': {
             'datasets': ['meatballs', 'cans', 'doughs', 'bottles'],
             'embeddings': ['CLIP', 'HOG', 'ResNet18'],
@@ -1069,16 +1214,16 @@ def create_hyperparameter_grid():
     grid_config = {
         # Embedding hyperparameters
         'CLIP': {
-            'padding': [0, 5, 10, 20],
+            'padding': [0, 5, 10],
             'clip_model': ['ViT-B/32', 'ViT-B/16']
         },
         'HOG': {
-            'padding': [0, 5, 10, 20],
+            'padding': [0, 5, 10],
             'hog_cell_size': [(8, 8), (16, 16)],
             'hog_block_size': [(2, 2), (3, 3)]
         },
         'ResNet18': {
-            'padding': [0, 5, 10, 20],
+            'padding': [0, 5, 10],
             'layers': [[2, 4, 6, 8], [4, 8]]
         },
         
@@ -1099,16 +1244,14 @@ def create_hyperparameter_grid():
             'n_estimators': [50, 100, 200],
             'max_depth': [None, 5, 10, 20],
             'min_samples_split': [2, 5, 10],
-            'use_PCA': [True, False],
-            'PCA_var': [0.9, 0.95, 0.99]
+            'criterion': ['gini', 'entropy'],
         },
         'LR': {
-            'C': [0.01, 0.1, 1.0, 10.0],
-            'solver': ['liblinear', 'lbfgs'],
-            'max_iter': [1000, 2000],
+            'C': [0.001, 0.01, 0.1, 1.0, 10.0],
+            'solver': ['liblinear'],
+            'penalty': ['l1', 'l2'],
+            'max_iter': [1000],
             'class_weight': [None, 'balanced'],
-            'use_PCA': [True, False],
-            'PCA_var': [0.9, 0.95, 0.99]
         }
     }
     return grid_config
@@ -1130,6 +1273,11 @@ def main():
     # Run integrated ablation study with hyperparameter tuning
     print("Running integrated ablation study...")
     results = study.run_integrated_ablation(grid_config)
+    
+    # Generate comprehensive report
+    print("\nGenerating final report...")
+    report_generator = SegmentationReportGenerator(config['output_dir'])
+    report_generator.generate_full_report(results, study.dataset_managers)
     
     print(f"Ablation study complete. Results saved to {config['output_dir']}")
     

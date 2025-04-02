@@ -820,6 +820,7 @@ class LogRegClassifier(Classifier):
         self.C = self.config.get('C', 1.0)
         self.solver = self.config.get('solver', 'liblinear')
         self.max_iter = self.config.get('max_iter', 1000)
+        self.penalty = self.config.get('penalty', 'l2')
         self.class_weight = self.config.get('class_weight', None)
         
         self.lr = LogisticRegression(
@@ -827,6 +828,7 @@ class LogRegClassifier(Classifier):
             solver=self.solver,
             max_iter=self.max_iter,
             class_weight=self.class_weight,
+            penalty=self.penalty,
             **self.config.get('lr_params', {})
         )
 
