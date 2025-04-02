@@ -2,12 +2,15 @@ TODO:
 [X] test Data loader + K-fold
 [X] test Models
 [X] test Report Generator
-[ ] Improve Report Generator:
-    - F1 score visualization: 1 large average and one small for each of the other 4
-    - Training size analysis: One plot pr. model with 1 line for each dataset and an average. Also it should include the max parformance?
-    - Computational Performance: add the other scatter with training time Performance.
-    - Model Consistency Analysis: Maybe we just delete Ranking correlation between datasets, it seems useless. SAme with Rank distribution.
-    - Delete conclusion
+[X] Improve Report Generator:
+    [X] F1 score visualization: 1 large average plot and one small plot for each of the datasets
+    [X] Training size analysis: One plot pr. model with 1 line for each dataset and an average. Also it should include the max parformance, i.e. training on full folds from the other data.
+    [X] Computational Performance: add the other scatter with training time Performance.
+    [X] Model Consistency Analysis: Maybe we just delete Ranking correlation between datasets.
+    [X] Delete conclusion
+    [X] Add Track 2 analysis, what part is SAMs fault.
 [X] Implement a second track mode in data loader
 [ ] Implement safeguard for training size analysis not to train on images without class examples (maybe even max them out)
-[ ] Fix study run order 
+[ ] Double check model hyperparameters (like lasso for LogReg)
+[ ] Fix study run order
+    [ ] Second track

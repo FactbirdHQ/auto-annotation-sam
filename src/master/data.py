@@ -352,14 +352,14 @@ class KFoldSegmentationManager:
             train_sampler = SubsetRandomSampler(train_idx)
             val_sampler = SubsetRandomSampler(val_idx)
             
-            train_loader = DataLoader(
+            val_loader = DataLoader(
                 dataset=self.dataset,
                 batch_size=batch_size,
                 sampler=train_sampler,
                 collate_fn=custom_collate_fn
             )
             
-            val_loader = DataLoader(
+            train_loader = DataLoader(
                 dataset=self.dataset,
                 batch_size=batch_size,
                 sampler=val_sampler,
@@ -370,7 +370,6 @@ class KFoldSegmentationManager:
         
         return fold_dataloaders
 
-##### Below here works as inteded #####
 
 def load_and_crop_data(img_path, label_path, crop_coords=None):
     """

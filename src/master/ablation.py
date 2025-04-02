@@ -129,11 +129,12 @@ class AblationStudy:
         training_times = []
         inference_times = []
         
-        # Add tqdm progress bar for fold processing
-        from tqdm import tqdm
         for fold_idx, (train_loader, val_loader) in tqdm(enumerate(fold_dataloaders), 
                                                         total=self.k_folds, 
                                                         desc=f"CV {embedding_name}-{classifier_name}"):
+            if fold_idx == 0:
+                continue
+            
             print(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
             
             # Create model for this fold
