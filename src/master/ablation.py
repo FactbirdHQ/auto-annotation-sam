@@ -9,6 +9,7 @@ import pandas as pd
 import time
 from sklearn.model_selection import ParameterGrid
 from scipy import stats
+import logging
 
 from src.master.report_generator import SegmentationReportGenerator
 from src.master.evaluate import evaluate_binary_masks, plot_precision_recall_curve, plot_threshold_vs_metrics
@@ -41,6 +42,32 @@ class AblationStudy:
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
+
+        # Set up logging
+        log_dir = os.path.join(self.output_dir, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        
+        # Configure file and console handlers
+        self.logger = logging.getLogger('ablation_study')
+        self.logger.setLevel(logging.DEBUG)
+        
+        # File handler for detailed logs
+        file_handler = logging.FileHandler(os.path.join(log_dir, 'ablation.log'))
+        file_handler.setLevel(logging.DEBUG)
+        
+        # Console handler for important info
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # Format for logs
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+        
+        self.logger.info("Initializing Ablation Study")
         
         # Initialize embedding and classifier factories
         self.embedding_factory = {
@@ -66,7 +93,7 @@ class AblationStudy:
         dataset_paths = self.config.get('dataset_paths', {})
         
         for name, path in dataset_paths.items():
-            print(f"Loading dataset: {name} from {path}")
+            self.logger.info(f"Loading dataset: {name} from {path}")
             try:
                 # Initialize dataset manager with proper class ID
                 class_id = self.config.get('class_ids', {}).get(name, 1)
@@ -75,27 +102,17 @@ class AblationStudy:
                 
                 # Print dataset info
                 info = dataset_manager.get_dataset_info()
-                print(f"  - Total samples: {info['total_samples']}")
-                print(f"  - Class ID: {info['class_id']}")
+                self.logger.info(f"  - Total samples: {info['total_samples']}")
+                self.logger.info(f"  - Class ID: {info['class_id']}")
                 
             except Exception as e:
-                print(f"Error loading dataset {name}: {e}")
+                self.logger.error(f"Error loading dataset {name}: {e}")
         
         return self.dataset_managers
     
     def _evaluate_model(self, model, train_data, val_data, return_predictions=False):
         """
         Core model evaluation logic used across different analysis methods
-        
-        Args:
-            model: Model to train and evaluate
-            train_data: Tuple of (train_images, train_masks, train_labels)
-            val_data: Tuple of (val_prediction_data, val_gt_masks)
-            return_predictions: Whether to return prediction masks and probabilities
-            
-        Returns:
-            Dictionary with evaluation metrics and timing information,
-            and optionally the prediction masks and probabilities
         """
         train_images, train_masks, train_labels = train_data
         val_prediction_data, val_gt_masks = val_data
@@ -105,57 +122,84 @@ class AblationStudy:
         model.fit(train_images, train_masks, train_labels)
         train_time = time.perf_counter() - start_time
         
-        # Collect predictions
-        val_pred_masks = []
-        val_pred_probs = []
+        # Initialize metrics
+        all_metrics = []
+        all_pred_masks = []
+        all_pred_probs = []
         
         # Time the inference process
         total_inference_time = 0
         num_predictions = 0
         
-        # Process each validation sample
-        for image, candidate_masks in val_prediction_data:
-            if candidate_masks:
-                # Time the prediction process for this sample
-                start_time = time.perf_counter()
-                pred_results, probs = model.predict(image, candidate_masks)
-                inference_time = time.perf_counter() - start_time
-                total_inference_time += inference_time
-                num_predictions += 1
+        # Process each validation sample with immediate evaluation
+        for i, (image, candidate_masks) in enumerate(val_prediction_data):
+            if not candidate_masks:
+                continue
                 
-                for (mask, pred_class), prob in zip(pred_results, probs):
-                    # Only keep masks predicted as positive (class 1)
-                    if pred_class == 1:
-                        val_pred_masks.append(mask)
-                        val_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
+            # Get ground truth masks for this image
+            # Assuming val_gt_masks is organized the same way as val_prediction_data
+            image_gt_masks = val_gt_masks[i] if i < len(val_gt_masks) else []
+                
+            # Time the prediction process for this sample
+            start_time = time.perf_counter()
+            pred_results, probs = model.predict(image, candidate_masks)
+            inference_time = time.perf_counter() - start_time
+            total_inference_time += inference_time
+            num_predictions += 1
+            
+            # Extract positive predictions
+            image_pred_masks = []
+            image_pred_probs = []
+            for (mask, pred_class), prob in zip(pred_results, probs):
+                # Only keep masks predicted as positive (class 1)
+                if pred_class == 1:
+                    image_pred_masks.append(mask)
+                    image_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
+            
+            # Save predictions for return if needed
+            all_pred_masks.extend(image_pred_masks)
+            all_pred_probs.extend(image_pred_probs)
+            
+            # Evaluate this image immediately
+            if image_gt_masks and image_pred_masks:
+                image_metrics = evaluate_binary_masks(image_gt_masks, image_pred_masks)
+                all_metrics.append(image_metrics)
         
         # Calculate average inference time
         avg_inference_time = total_inference_time / max(1, num_predictions)
         
-        # Sort masks by probability
-        if val_pred_masks and val_pred_probs:
-            val_pred_masks, val_pred_probs = self._sort_by_probability(val_pred_masks, val_pred_probs)
-        
-        # Evaluate predictions
-        metrics = None
-        if val_gt_masks and val_pred_masks:
-            metrics = evaluate_binary_masks(val_gt_masks, val_pred_masks)
-            metrics['training_time'] = train_time
-            metrics['inference_time'] = avg_inference_time
+        # Aggregate metrics across all images
+        if all_metrics:
+            aggregated_metrics = {
+                'mask_precision': np.mean([m['mask_precision'] for m in all_metrics]),
+                'mask_recall': np.mean([m['mask_recall'] for m in all_metrics]),
+                'mask_f1': np.mean([m['mask_f1'] for m in all_metrics]),
+                'detected_masks': sum(m['detected_masks'] for m in all_metrics),
+                'total_gt_masks': sum(m['total_gt_masks'] for m in all_metrics),
+                'avg_iou_detected': np.mean([m['avg_iou_detected'] for m in all_metrics if m['avg_iou_detected'] > 0]),
+                'avg_iou_all': np.mean([m['avg_iou_all'] for m in all_metrics]),
+                'training_time': train_time,
+                'inference_time': avg_inference_time
+            }
         else:
             # Return empty metrics if no predictions
-            metrics = {
+            aggregated_metrics = {
                 'mask_precision': 0, 
                 'mask_recall': 0,
                 'mask_f1': 0,
+                'detected_masks': 0,
+                'total_gt_masks': sum(len(gt) for gt in val_gt_masks) if val_gt_masks else 0,
+                'avg_iou_detected': 0,
+                'avg_iou_all': 0,
                 'training_time': train_time,
                 'inference_time': avg_inference_time
             }
         
         if return_predictions:
-            return metrics, val_pred_masks, val_pred_probs
+            return aggregated_metrics, all_pred_masks, all_pred_probs
         else:
-            return metrics
+            return aggregated_metrics
+            
 
     
     def create_model(self, embedding_name, classifier_name, embedding_config=None, classifier_config=None):
@@ -176,6 +220,9 @@ class AblationStudy:
         if classifier_name not in self.classifier_factory:
             raise ValueError(f"Unknown classifier: {classifier_name}")
         
+        self.logger.info(f"Creating model: {embedding_name} + {classifier_name}")
+        self.logger.debug(f"Embedding config: {embedding_config}")
+        self.logger.debug(f"Classifier config: {classifier_config}")
         # Use empty dict if configs are None
         embedding_config = embedding_config or {}
         classifier_config = classifier_config or {}
@@ -205,6 +252,11 @@ class AblationStudy:
             Tuple of (metrics, model) where metrics is a dictionary with evaluation results
             and model is the trained model
         """
+
+        import psutil
+        mem_before = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
+        self.logger.info(f"Memory before model creation: {mem_before:.2f} MB")
+
         # Get dataset manager
         if dataset_name not in self.dataset_managers:
             raise ValueError(f"Dataset {dataset_name} not loaded")
@@ -223,7 +275,7 @@ class AblationStudy:
         # Get ground truth masks for validation
         val_gt_masks = []
         for batch in val_loader:
-            batch_gt_masks = batch['gt_binary_mask']
+            batch_gt_masks = batch['gt_binary_masks']
             batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
             
             for i, has_gt in enumerate(batch_has_gt):
@@ -242,9 +294,12 @@ class AblationStudy:
                                         (train_images, train_masks, train_labels),
                                         (val_prediction_data, val_gt_masks))
             
+            mem_after = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
+            self.logger.info(f"Memory after evaluation: {mem_after:.2f} MB (diff: {mem_after-mem_before:.2f} MB)")
+
             return metrics, model
         except Exception as e:
-            print(f"Error evaluating {embedding_name}-{classifier_name} on {dataset_name}: {e}")
+            self.logger.error(f"Error evaluating {embedding_name}-{classifier_name} on {dataset_name}: {e}")
             if model is not None:
                 self._cleanup_model(model)
             return None, None
@@ -260,7 +315,7 @@ class AblationStudy:
             del model
             gc.collect()
         except Exception as e:
-            print(f"Error cleaning up model: {e}")
+            self.logger.error(f"Error cleaning up model: {e}")
     
     def _save_to_json(self, data, filename):
         """
@@ -366,7 +421,7 @@ class AblationStudy:
         # Process datasets
         for dataset_name, dataset_dict in realistic_results.items():
             if dataset_name not in self.dataset_managers:
-                print(f"Warning: Dataset {dataset_name} not loaded. Skipping.")
+                self.logger.warning(f"Warning: Dataset {dataset_name} not loaded. Skipping.")
                 continue
                 
             ideal_results[dataset_name] = {}
@@ -383,10 +438,10 @@ class AblationStudy:
                     if (dataset_name not in best_configs or
                         embedding_name not in best_configs[dataset_name] or
                         classifier_name not in best_configs[dataset_name][embedding_name]):
-                        print(f"Skipping {dataset_name}, {embedding_name}, {classifier_name} - no best config")
+                        self.logger.info(f"Skipping {dataset_name}, {embedding_name}, {classifier_name} - no best config")
                         continue
                     
-                    print(f"\nProcessing {dataset_name}, {embedding_name}, {classifier_name}")
+                    self.logger.info(f"\nProcessing {dataset_name}, {embedding_name}, {classifier_name}")
                     
                     # Get best configs
                     best_config = best_configs[dataset_name][embedding_name][classifier_name]
@@ -398,7 +453,7 @@ class AblationStudy:
                     
                     # Process each fold (skipping fold 0, which is for hyperparameter tuning)
                     for fold_idx in range(1, self.k_folds):
-                        print(f"  Processing fold {fold_idx}/{self.k_folds-1}")
+                        self.logger.info(f"  Processing fold {fold_idx}/{self.k_folds-1}")
                         
                         # Get training and validation data for this fold, with return_combined=True for ideal track
                         train_data, val_data = self._get_train_val_data(
@@ -409,7 +464,7 @@ class AblationStudy:
                         val_prediction_data, val_gt_masks = val_data
                         
                         if not train_images:
-                            print(f"  No training data for fold {fold_idx}")
+                            self.logger.debug(f"  No training data for fold {fold_idx}")
                             continue
                         
                         # Create and evaluate model
@@ -429,7 +484,7 @@ class AblationStudy:
                             fold_metrics.append(metrics)
                             
                         except Exception as e:
-                            print(f"  Error evaluating {embedding_name}-{classifier_name} on fold {fold_idx}: {e}")
+                            self.logger.error(f"  Error evaluating {embedding_name}-{classifier_name} on fold {fold_idx}: {e}")
                             continue
                         finally:
                             # Clean up model
@@ -474,7 +529,7 @@ class AblationStudy:
             if fold_idx == 0:
                 continue  # Skip fold 0 (reserved for hyperparameter tuning)
                 
-            print(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
+            self.logger.info(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
             
             # Create model for this fold
             model = None
@@ -485,11 +540,11 @@ class AblationStudy:
                 val_prediction_data, val_gt_masks = val_data
                 
                 if not train_images:
-                    print(f"No training data for fold {fold_idx+1}")
+                    self.logger.debug(f"No training data for fold {fold_idx+1}")
                     continue
                     
                 if not val_prediction_data:
-                    print(f"No validation data for fold {fold_idx+1}")
+                    self.logger.debug(f"No validation data for fold {fold_idx+1}")
                     continue
                     
                 # Create and evaluate model
@@ -664,8 +719,8 @@ class AblationStudy:
         
         # Calculate total combinations
         total_configs = len(embedding_param_grid) * len(classifier_param_grid)
-        print(f"Grid search with {len(embedding_param_grid)} embedding configs and {len(classifier_param_grid)} classifier configs")
-        print(f"Total configurations to try: {total_configs}")
+        self.logger.info(f"Grid search with {len(embedding_param_grid)} embedding configs and {len(classifier_param_grid)} classifier configs")
+        self.logger.info(f"Total configurations to try: {total_configs}")
         
         # Track best configuration and performance
         best_config = {'embedding': {}, 'classifier': {}}
@@ -1186,25 +1241,21 @@ def create_default_config():
     """Create a default configuration for ablation study"""
     config = {
         'dataset_paths': {
-            'meatballs': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/meatballs',
-            'cans': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/cans',
-            'doughs': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/doughs',
-            'bottles': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/bottles',
+            'meatballs': 'C:/Users/GustavToft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/meatballs',
+            'cans': 'C:/Users/GustavToft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/cans',
         },
         'class_ids': {
             'meatballs': 1,
             'cans': 1,
-            'doughs': 1,
-            'bottles': 1,
         },
-        'embeddings': ['CLIP', 'HOG', 'ResNet18'],
-        'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
+        'embeddings': ['CLIP'],
+        'classifiers': ['KNN', 'LR'],
         'output_dir': './ablation_results',
         'k_folds': 5,
         'hyperparameter_study': {
-            'datasets': ['meatballs', 'cans', 'doughs', 'bottles'],
-            'embeddings': ['CLIP', 'HOG', 'ResNet18'],
-            'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
+            'datasets': ['meatballs', 'cans',],
+            'embeddings': ['CLIP',],
+            'classifiers': ['KNN', 'LR'],
         }
     }
     return config
@@ -1214,44 +1265,23 @@ def create_hyperparameter_grid():
     grid_config = {
         # Embedding hyperparameters
         'CLIP': {
-            'padding': [0, 5, 10],
-            'clip_model': ['ViT-B/32', 'ViT-B/16']
-        },
-        'HOG': {
-            'padding': [0, 5, 10],
-            'hog_cell_size': [(8, 8), (16, 16)],
-            'hog_block_size': [(2, 2), (3, 3)]
-        },
-        'ResNet18': {
-            'padding': [0, 5, 10],
-            'layers': [[2, 4, 6, 8], [4, 8]]
+            'padding': [0, 5],
+            'clip_model': ['ViT-B/32']
         },
         
         # Classifier hyperparameters
         'KNN': {
-            'n_neighbors': [3, 5, 7, 9],
-            'metric': ['cosine', 'euclidean', 'manhattan'],
-            'use_PCA': [True, False],
-            'PCA_var': [0.9, 0.95, 0.99]
-        },
-        'SVM': {
-            'C': [0.1, 1.0, 10.0, 100.0],
-            'kernel': ['rbf', 'linear', 'poly'],
-            'use_PCA': [True, False],
-            'PCA_var': [0.9, 0.95, 0.99]
-        },
-        'RF': {
-            'n_estimators': [50, 100, 200],
-            'max_depth': [None, 5, 10, 20],
-            'min_samples_split': [2, 5, 10],
-            'criterion': ['gini', 'entropy'],
+            'n_neighbors': [5],
+            'metric': ['cosine', 'manhattan'],
+            'use_PCA': [True],
+            'PCA_var': [0.95]
         },
         'LR': {
-            'C': [0.001, 0.01, 0.1, 1.0, 10.0],
+            'C': [0.01, 0.1],
             'solver': ['liblinear'],
-            'penalty': ['l1', 'l2'],
+            'penalty': ['l2'],
             'max_iter': [1000],
-            'class_weight': [None, 'balanced'],
+            'class_weight': [None],
         }
     }
     return grid_config
