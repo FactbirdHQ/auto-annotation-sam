@@ -1284,25 +1284,25 @@ def create_hyperparameter_grid():
         
         # Classifier hyperparameters
         'KNN': {
-            'n_neighbors': [3, 5, 7, 9],
+            'n_neighbors': [3, 5, 7],
             'metric': ['cosine', 'manhattan'],
-            'use_PCA': [True, False],
+            'use_PCA': [True],
             'PCA_var': [0.9, 0.95, 0.99]
         },
         'SVM': {
-            'C': [0.1, 1.0, 10.0, 100.0],
-            'kernel': ['rbf', 'linear', 'poly'],
-            'use_PCA': [True, False],
-            'PCA_var': [0.9, 0.95, 0.99]
+            'C': [0.1, 1.0, 10.0],
+            'kernel': ['rbf', 'linear'],
+            'use_PCA': [True],
+            'PCA_var': [0.95, 0.99]
         },
         'RF': {
             'n_estimators': [50, 100, 200],
-            'max_depth': [None, 5, 10, 20],
-            'min_samples_split': [2, 5, 10],
-            'criterion': ['gini', 'entropy'],
+            'max_depth': [None],
+            'min_samples_split': [2, 5],
+            'criterion': ['gini'],
         },
         'LR': {
-            'C': [0.001, 0.01, 0.1, 1.0, 10.0],
+            'C': [0.01, 0.1, 1.0],
             'solver': ['liblinear'],
             'penalty': ['l1', 'l2'],
             'max_iter': [1000],
