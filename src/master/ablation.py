@@ -1241,21 +1241,25 @@ def create_default_config():
     """Create a default configuration for ablation study"""
     config = {
         'dataset_paths': {
-            'meatballs': 'C:/Users/GustavToft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/meatballs',
-            'cans': 'C:/Users/GustavToft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/cans',
+            'meatballs': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/meatballs',
+            'cans': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/cans',
+            'doughs': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/doughs',
+            'bottles': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/bottles',
         },
         'class_ids': {
             'meatballs': 1,
             'cans': 1,
+            'doughs': 1,
+            'bottles': 1,
         },
-        'embeddings': ['CLIP'],
-        'classifiers': ['KNN', 'LR'],
+        'embeddings': ['CLIP', 'HOG', 'ResNet18'],
+        'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
         'output_dir': './ablation_results',
         'k_folds': 5,
         'hyperparameter_study': {
-            'datasets': ['meatballs', 'cans',],
-            'embeddings': ['CLIP',],
-            'classifiers': ['KNN', 'LR'],
+            'datasets': ['meatballs', 'cans', 'doughs', 'bottles'],
+            'embeddings': ['CLIP', 'HOG', 'ResNet18'],
+            'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
         }
     }
     return config
@@ -1265,23 +1269,44 @@ def create_hyperparameter_grid():
     grid_config = {
         # Embedding hyperparameters
         'CLIP': {
-            'padding': [0, 5],
+            'padding': [0, 5, 10],
             'clip_model': ['ViT-B/32']
+        },
+        'HOG': {
+            'padding': [0, 5, 10],
+            'hog_cell_size': [(8, 8), (16, 16)],
+            'hog_block_size': [(2, 2), (3, 3)]
+        },
+        'ResNet18': {
+            'padding': [0, 5, 10],
+            'layers': [[2, 4, 6, 8]]
         },
         
         # Classifier hyperparameters
         'KNN': {
-            'n_neighbors': [5],
+            'n_neighbors': [3, 5, 7, 9],
             'metric': ['cosine', 'manhattan'],
-            'use_PCA': [True],
-            'PCA_var': [0.95]
+            'use_PCA': [True, False],
+            'PCA_var': [0.9, 0.95, 0.99]
+        },
+        'SVM': {
+            'C': [0.1, 1.0, 10.0, 100.0],
+            'kernel': ['rbf', 'linear', 'poly'],
+            'use_PCA': [True, False],
+            'PCA_var': [0.9, 0.95, 0.99]
+        },
+        'RF': {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [None, 5, 10, 20],
+            'min_samples_split': [2, 5, 10],
+            'criterion': ['gini', 'entropy'],
         },
         'LR': {
-            'C': [0.01, 0.1],
+            'C': [0.001, 0.01, 0.1, 1.0, 10.0],
             'solver': ['liblinear'],
-            'penalty': ['l2'],
+            'penalty': ['l1', 'l2'],
             'max_iter': [1000],
-            'class_weight': [None],
+            'class_weight': [None, 'balanced'],
         }
     }
     return grid_config
