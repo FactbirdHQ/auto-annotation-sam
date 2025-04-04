@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 
 def evaluate_binary_masks(gt_masks, pred_masks, iou_threshold=0.5):
     """
-    Calculate evaluation statistics between ground truth and predicted binary masks.
+    Optimized version of evaluate_binary_masks for better performance.
     
     Parameters:
     -----------
@@ -19,62 +19,79 @@ def evaluate_binary_masks(gt_masks, pred_masks, iou_threshold=0.5):
     Returns:
     --------
     dict
-        Dictionary with evaluation metrics including both pixel-level and mask-level metrics
+        Dictionary with evaluation metrics
     """
     total_gt_masks = len(gt_masks)
     total_pred_masks = len(pred_masks)
     
-    # Calculate IoU between all pairs of GT and predicted masks
+    # Early return for empty cases
+    if total_gt_masks == 0 or total_pred_masks == 0:
+        return {
+            'mask_precision': 0 if total_pred_masks > 0 else 1.0,  # Precision is 1.0 if no predictions (no false positives)
+            'mask_recall': 0 if total_gt_masks > 0 else 1.0,       # Recall is 1.0 if no ground truth (no false negatives)
+            'mask_f1': 0,
+            'detected_masks': 0,
+            'total_gt_masks': total_gt_masks,
+            'total_pred_masks': total_pred_masks,
+            'avg_iou_detected': 0,
+            'avg_iou_all': 0,
+            'best_ious': []
+        }
+    
+    # Pre-compute binary masks once
+    gt_binary = [(mask > 0).astype(np.uint8) for mask in gt_masks]
+    pred_binary = [(mask > 0).astype(np.uint8) for mask in pred_masks]
+    
+    # Create IoU matrix more efficiently
     iou_matrix = np.zeros((total_gt_masks, total_pred_masks))
     
-    for i, gt_mask in enumerate(gt_masks):
-        gt_binary = (gt_mask > 0).astype(np.uint8)
-        
-        for j, pred_mask in enumerate(pred_masks):
-            if gt_binary.shape != pred_mask.shape:
-                raise ValueError(f"Shape mismatch: GT mask {i} shape {gt_binary.shape} vs Pred mask {j} shape {pred_mask.shape}")
+    # Optimize IoU calculation with vectorization where possible
+    for i, gt in enumerate(gt_binary):
+        gt_sum = gt.sum()  # Pre-compute sum of GT mask
+        if gt_sum == 0:
+            continue  # Skip empty GT masks
             
-            pred_binary = (pred_mask > 0).astype(np.uint8)
+        for j, pred in enumerate(pred_binary):
+            # Use fast bitwise operations
+            intersection = np.logical_and(gt, pred).sum()
+            if intersection == 0:
+                continue  # Skip if no intersection (IoU will be 0)
+                
+            # Union = sum of both masks - intersection
+            pred_sum = pred.sum()  # Pre-compute sum of pred mask
+            union = gt_sum + pred_sum - intersection
             
-            # Calculate IoU
-            intersection = np.logical_and(gt_binary, pred_binary).sum()
-            union = np.logical_or(gt_binary, pred_binary).sum()
-            iou = intersection / union if union > 0 else 0
-            iou_matrix[i, j] = iou
+            iou_matrix[i, j] = intersection / union if union > 0 else 0
     
-    # For each GT mask, find the predicted mask with highest IoU
-    best_ious = np.max(iou_matrix, axis=1) if total_pred_masks > 0 else np.zeros(total_gt_masks)
+    # Process the IoU matrix with numpy operations
+    best_ious = np.max(iou_matrix, axis=1)
+    detected_mask_indices = best_ious >= iou_threshold
+    detected_masks = np.sum(detected_mask_indices)
     
-    # Count detected masks (those with IoU >= threshold)
-    detected_masks = np.sum(best_ious >= iou_threshold)
-    
-    # Calculate TP, FP, FN for mask-level metrics
+    # Calculate precision, recall, F1
     true_positives = detected_masks
     false_negatives = total_gt_masks - detected_masks
     false_positives = total_pred_masks - detected_masks
     
-    # Calculate mask-level metrics
-    mask_precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
-    mask_recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
-    mask_f1 = 2 * (mask_precision * mask_recall) / (mask_precision + mask_recall) if (mask_precision + mask_recall) > 0 else 0
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
     
-    # Calculate average IoU for detected masks only
-    avg_iou_detected = np.mean(best_ious[best_ious >= iou_threshold]) if np.any(best_ious >= iou_threshold) else 0
-    
-    # Calculate average IoU across all GT masks (including undetected ones)
+    # Calculate average IoU statistics
+    avg_iou_detected = np.mean(best_ious[detected_mask_indices]) if np.any(detected_mask_indices) else 0
     avg_iou_all = np.mean(best_ious)
     
     # Create metrics dictionary
     metrics = {
-        'mask_precision': mask_precision,
-        'mask_recall': mask_recall,
-        'mask_f1': mask_f1,
+        'mask_precision': precision,
+        'mask_recall': recall,
+        'mask_f1': f1,
         'detected_masks': int(detected_masks),
         'total_gt_masks': total_gt_masks,
         'total_pred_masks': total_pred_masks,
         'avg_iou_detected': avg_iou_detected,
         'avg_iou_all': avg_iou_all,
-        'best_ious': best_ious.tolist(),  # IoU of each GT mask with its best matching prediction
+        'best_ious': best_ious.tolist()  # Convert to list for JSON serialization
     }
     
     return metrics
