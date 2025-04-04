@@ -10,6 +10,7 @@ import time
 from sklearn.model_selection import ParameterGrid
 from scipy import stats
 import logging
+import concurrent.futures
 
 from src.master.report_generator import SegmentationReportGenerator
 from src.master.evaluate import evaluate_binary_masks, plot_precision_recall_curve, plot_threshold_vs_metrics
@@ -68,6 +69,10 @@ class AblationStudy:
         self.logger.addHandler(console_handler)
         
         self.logger.info("Initializing Ablation Study")
+
+        # Set the maximum number of workers for concurrent execution
+        self.max_workers = config.get('max_workers', os.cpu_count())
+        self.logger.info(f"Using up to {self.max_workers} concurrent workers")
         
         # Initialize embedding and classifier factories
         self.embedding_factory = {
@@ -506,9 +511,19 @@ class AblationStudy:
         return comparison_results
     
     def perform_cross_validation(self, dataset_name, embedding_name, classifier_name, 
-                    embedding_config=None, classifier_config=None):
+                                embedding_config=None, classifier_config=None):
         """
-        Perform k-fold cross-validation for a specific dataset, embedding, and classifier
+        Perform k-fold cross-validation using concurrent execution
+        
+        Args:
+            dataset_name: Dataset name
+            embedding_name: Embedding name 
+            classifier_name: Classifier name
+            embedding_config: Configuration for embedding
+            classifier_config: Configuration for classifier
+            
+        Returns:
+            Dictionary with aggregated metrics across folds
         """
         if dataset_name not in self.dataset_managers:
             raise ValueError(f"Dataset {dataset_name} not loaded")
@@ -518,18 +533,12 @@ class AblationStudy:
         # Get k-fold data loaders
         fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
         
-        # Track metrics across all folds
-        fold_metrics = []
-        training_times = []
-        inference_times = []
-        
-        for fold_idx, (train_loader, val_loader) in tqdm(enumerate(fold_dataloaders), 
-                                                        total=self.k_folds, 
-                                                        desc=f"CV {embedding_name}-{classifier_name}"):
+        # Define worker function for each fold
+        def process_fold(fold_idx):
             if fold_idx == 0:
-                continue  # Skip fold 0 (reserved for hyperparameter tuning)
+                return None  # Skip fold 0 (reserved for hyperparameter tuning)
                 
-            self.logger.info(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
+            print(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
             
             # Create model for this fold
             model = None
@@ -540,12 +549,12 @@ class AblationStudy:
                 val_prediction_data, val_gt_masks = val_data
                 
                 if not train_images:
-                    self.logger.debug(f"No training data for fold {fold_idx+1}")
-                    continue
+                    print(f"No training data for fold {fold_idx+1}")
+                    return None
                     
                 if not val_prediction_data:
-                    self.logger.debug(f"No validation data for fold {fold_idx+1}")
-                    continue
+                    print(f"No validation data for fold {fold_idx+1}")
+                    return None
                     
                 # Create and evaluate model
                 model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
@@ -560,26 +569,47 @@ class AblationStudy:
                 
                 # Add fold index to metrics
                 metrics['fold'] = fold_idx
-                fold_metrics.append(metrics)
-                
-                # Track timing metrics
-                training_times.append(metrics['training_time'])
-                inference_times.append(metrics['inference_time'])
                 
                 # Save precision-recall curve for this fold
                 self._save_pr_curve(val_gt_masks, val_pred_masks, val_pred_probs, 
                                 dataset_name, embedding_name, classifier_name, fold_idx)
-                    
+                
+                return metrics
+                
+            except Exception as e:
+                print(f"Error evaluating {embedding_name}-{classifier_name} on fold {fold_idx}: {e}")
+                return None
             finally:
                 # Use dedicated cleanup helper
                 self._cleanup_model(model)
+        
+        # Track metrics across all folds
+        fold_metrics = []
+        
+        # Use ThreadPoolExecutor for I/O-bound tasks
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all folds for processing (skip fold 0)
+            future_to_fold = {
+                executor.submit(process_fold, fold_idx): fold_idx 
+                for fold_idx in range(1, self.k_folds)
+            }
+            
+            # Process results as they complete
+            for future in tqdm(
+                concurrent.futures.as_completed(future_to_fold), 
+                total=len(future_to_fold),
+                desc=f"CV {embedding_name}-{classifier_name}"
+            ):
+                metrics = future.result()
+                if metrics is not None:
+                    fold_metrics.append(metrics)
         
         # Aggregate metrics across folds
         if fold_metrics:
             aggregated_metrics = self._aggregate_fold_metrics(fold_metrics)
             # Add average timing information
-            aggregated_metrics['avg_training_time'] = np.mean(training_times)
-            aggregated_metrics['avg_inference_time'] = np.mean(inference_times)
+            aggregated_metrics['avg_training_time'] = np.mean([m['training_time'] for m in fold_metrics])
+            aggregated_metrics['avg_inference_time'] = np.mean([m['inference_time'] for m in fold_metrics])
             return aggregated_metrics
         else:
             return None
@@ -704,7 +734,16 @@ class AblationStudy:
     
     def hyperparameter_grid_search(self, dataset_name, embedding_name, classifier_name, grid_config):
         """
-        Perform grid search over hyperparameters for a specific dataset, embedding, and classifier
+        Perform grid search over hyperparameters using concurrent execution
+        
+        Args:
+            dataset_name: Dataset name
+            embedding_name: Embedding name
+            classifier_name: Classifier name
+            grid_config: Dictionary with hyperparameter grids
+            
+        Returns:
+            Dictionary with best configuration and metrics
         """
         # Get parameter grids
         embedding_grid = grid_config.get(embedding_name, {})
@@ -717,52 +756,75 @@ class AblationStudy:
         embedding_param_grid = list(ParameterGrid(embedding_grid)) if embedding_grid else [{}]
         classifier_param_grid = list(ParameterGrid(classifier_grid)) if classifier_grid else [{}]
         
+        # Create all parameter combinations
+        param_combinations = []
+        for emb_config in embedding_param_grid:
+            for cls_config in classifier_param_grid:
+                param_combinations.append((emb_config, cls_config))
+        
         # Calculate total combinations
-        total_configs = len(embedding_param_grid) * len(classifier_param_grid)
-        self.logger.info(f"Grid search with {len(embedding_param_grid)} embedding configs and {len(classifier_param_grid)} classifier configs")
-        self.logger.info(f"Total configurations to try: {total_configs}")
+        total_configs = len(param_combinations)
+        print(f"Grid search with {len(embedding_param_grid)} embedding configs and {len(classifier_param_grid)} classifier configs")
+        print(f"Total configurations to try: {total_configs}")
+        
+        # Create a worker function for concurrent execution
+        def evaluate_config(combo_idx):
+            emb_config, cls_config = param_combinations[combo_idx]
+            try:
+                metrics, model = self._create_and_evaluate_model(
+                    dataset_name, embedding_name, classifier_name,
+                    emb_config, cls_config
+                )
+                
+                # Clean up model regardless of result
+                if model is not None:
+                    self._cleanup_model(model)
+                
+                # Return results if evaluation was successful
+                if metrics is not None:
+                    return {
+                        'embedding_config': emb_config,
+                        'classifier_config': cls_config,
+                        'metrics': metrics,
+                        'combo_idx': combo_idx
+                    }
+                return None
+            except Exception as e:
+                print(f"Error evaluating config {combo_idx}: {e}")
+                return None
         
         # Track best configuration and performance
         best_config = {'embedding': {}, 'classifier': {}}
         best_f1 = -1
         all_results = []
         
-        # Create tqdm progress bar for the grid search
-        with tqdm(total=total_configs, desc=f"Grid search {embedding_name}-{classifier_name}") as pbar:
-            # Try each combination of parameters
-            for emb_config in embedding_param_grid:
-                for cls_config in classifier_param_grid:
-                    metrics, model = self._create_and_evaluate_model(
-                        dataset_name, embedding_name, classifier_name,
-                        emb_config, cls_config
-                    )
+        # Use a ProcessPoolExecutor for CPU-bound tasks
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all jobs
+            future_to_idx = {
+                executor.submit(evaluate_config, i): i
+                for i in range(total_configs)
+            }
+            
+            # Process results as they complete
+            with tqdm(total=total_configs, desc=f"Grid search {embedding_name}-{classifier_name}") as pbar:
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    result = future.result()
+                    pbar.update(1)
                     
-                    # Clean up model regardless of result
-                    if model is not None:
-                        self._cleanup_model(model)
-                    
-                    # Save results if evaluation was successful
-                    if metrics is not None:
-                        result = {
-                            'embedding_config': emb_config,
-                            'classifier_config': cls_config,
-                            'metrics': metrics
-                        }
+                    if result is not None:
                         all_results.append(result)
                         
                         # Update best configuration if better F1 score
+                        metrics = result['metrics']
                         if metrics['mask_f1'] > best_f1:
                             best_f1 = metrics['mask_f1']
                             best_config = {
-                                'embedding': emb_config,
-                                'classifier': cls_config,
+                                'embedding': result['embedding_config'],
+                                'classifier': result['classifier_config'],
                                 'metrics': metrics
                             }
-                            # Update progress bar with best F1 score
                             pbar.set_postfix({"Best F1": f"{best_f1:.4f}"})
-                    
-                    # Update progress bar
-                    pbar.update(1)
         
         # Save all grid search results
         self._save_grid_search_results(dataset_name, embedding_name, classifier_name, all_results)
@@ -770,11 +832,21 @@ class AblationStudy:
         return best_config
     
     def perform_training_size_analysis(self, dataset_name, embedding_name, classifier_name, 
-                      embedding_config=None, classifier_config=None,
-                      training_sizes=None):
+                                     embedding_config=None, classifier_config=None,
+                                     training_sizes=None):
         """
-        Perform analysis of how model performance scales with training set size,
-        prioritizing images with the most ground truth masks
+        Perform analysis of training set size using concurrent execution
+        
+        Args:
+            dataset_name: Dataset name
+            embedding_name: Embedding name
+            classifier_name: Classifier name
+            embedding_config: Configuration for embedding
+            classifier_config: Configuration for classifier
+            training_sizes: List of training set sizes to test
+            
+        Returns:
+            Dictionary with metrics for each training size
         """
         training_sizes = training_sizes or [1, 2, 3, 5, 10]
         
@@ -789,131 +861,147 @@ class AblationStudy:
         # Track metrics across all folds and training sizes
         training_size_metrics = {size: [] for size in training_sizes}
         
+        # Define a worker function for each fold and training size
+        def process_fold_and_size(task):
+            fold_idx, train_size, subset_idx = task
+            
+            # Get training and validation data
+            train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
+            all_train_images, all_train_masks, all_train_labels = train_data
+            val_prediction_data, val_gt_masks = val_data
+            
+            if not all_train_images:
+                print(f"No training data for fold {fold_idx}")
+                return None
+            
+            # Calculate information content (number of GT masks) for each training image
+            image_info_scores = []
+            for i, masks in enumerate(all_train_masks):
+                # Count the number of ground truth masks (where label is 1)
+                gt_mask_count = sum(1 for j, label in enumerate(all_train_labels[i]) 
+                                  if label == 1)
+                image_info_scores.append((i, gt_mask_count))
+            
+            # Sort by information content (highest number of GT masks first)
+            image_info_scores.sort(key=lambda x: x[1], reverse=True)
+            sorted_indices = [item[0] for item in image_info_scores]
+            
+            # For the first subset, always use the most informative images
+            if subset_idx == 0:
+                # Take the top train_size most informative images
+                indices = sorted_indices[:train_size]
+            else:
+                # For additional subsets, select randomly from remaining images
+                available_indices = list(set(range(len(all_train_images))) - set(sorted_indices[:train_size]))
+                if len(available_indices) < train_size:
+                    # If not enough remaining images, use random sampling with replacement
+                    indices = np.random.choice(range(len(all_train_images)), train_size, replace=True)
+                else:
+                    # Otherwise, sample without replacement from remaining images
+                    indices = np.random.choice(available_indices, train_size, replace=False)
+            
+            # Create the subset
+            subset_images = [all_train_images[i] for i in indices]
+            subset_masks = [all_train_masks[i] for i in indices]
+            subset_labels = [all_train_labels[i] for i in indices]
+            
+            # Create model
+            model = None
+            try:
+                model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
+                
+                # Evaluate model using the helper method
+                metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
+                    model,
+                    (subset_images, subset_masks, subset_labels),
+                    (val_prediction_data, val_gt_masks),
+                    return_predictions=True
+                )
+                
+                # Add metadata
+                metrics['fold'] = fold_idx
+                metrics['subset'] = subset_idx
+                metrics['train_size'] = train_size
+                
+                # Save precision-recall curve for this fold and subset
+                self._save_pr_curve(
+                    val_gt_masks, val_pred_masks, val_pred_probs,
+                    f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
+                    f"{fold_idx}_{subset_idx}"
+                )
+                
+                return metrics
+            except Exception as e:
+                print(f"Error processing fold {fold_idx}, size {train_size}, subset {subset_idx}: {e}")
+                return None
+            finally:
+                # Use dedicated cleanup helper
+                self._cleanup_model(model)
+        
+        # Create list of all tasks
+        tasks = []
+        
         # Calculate total iterations
-        total_iterations = 0
         for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders[1:], 1):
             train_images, _, _ = dataset_manager.get_training_data(train_loader)
             if train_images:
                 for train_size in training_sizes:
                     if train_size <= len(train_images):
                         num_subsets = min(5, len(train_images) // train_size)
-                        total_iterations += num_subsets
+                        for subset_idx in range(num_subsets):
+                            tasks.append((fold_idx, train_size, subset_idx))
         
-        # Create progress bar for overall progress
-        with tqdm(total=total_iterations, desc=f"Training size analysis {embedding_name}-{classifier_name}") as pbar:
-            # For each fold (except fold 0 reserved for hyperparameter tuning)
-            for fold_idx, (train_loader, val_loader) in enumerate(fold_dataloaders[1:], 1):
-                print(f"\nProcessing fold {fold_idx}/{self.k_folds}")
-                
-                # Get all training and validation data
-                train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
-                all_train_images, all_train_masks, all_train_labels = train_data
-                val_prediction_data, val_gt_masks = val_data
-                
-                if not all_train_images:
-                    print(f"No training data for fold {fold_idx}")
-                    continue
-                
-                # Calculate information content (number of GT masks) for each training image
-                image_info_scores = []
-                for i, masks in enumerate(all_train_masks):
-                    # Count the number of ground truth masks (where label is 1)
-                    gt_mask_count = sum(1 for j, label in enumerate(all_train_labels[i]) 
-                                        if label == 1)
-                    image_info_scores.append((i, gt_mask_count))
-                
-                # Sort by information content (highest number of GT masks first)
-                image_info_scores.sort(key=lambda x: x[1], reverse=True)
-                sorted_indices = [item[0] for item in image_info_scores]
-                
-                # For each training size
-                for train_size in training_sizes:
-                    if train_size > len(all_train_images):
-                        print(f"Training size {train_size} exceeds available data ({len(all_train_images)})")
-                        continue
+        # Process tasks with concurrent execution
+        with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_task = {
+                executor.submit(process_fold_and_size, task): task
+                for task in tasks
+            }
+            
+            # Process results as they complete
+            with tqdm(total=len(tasks), desc=f"Training size analysis {embedding_name}-{classifier_name}") as pbar:
+                for future in concurrent.futures.as_completed(future_to_task):
+                    task = future_to_task[future]
+                    fold_idx, train_size, subset_idx = task
+                    metrics = future.result()
                     
-                    # Create multiple subsets for each training size
-                    num_subsets = min(5, len(all_train_images) // train_size)
-                    subset_metrics = []
+                    if metrics is not None:
+                        training_size_metrics[train_size].append(metrics)
                     
-                    for subset_idx in range(num_subsets):
-                        # For the first subset, always use the most informative images
-                        if subset_idx == 0:
-                            # Take the top train_size most informative images
-                            indices = sorted_indices[:train_size]
-                        else:
-                            # For additional subsets, select randomly from remaining images
-                            available_indices = list(set(range(len(all_train_images))) - set(sorted_indices[:train_size]))
-                            if len(available_indices) < train_size:
-                                # If not enough remaining images, use random sampling with replacement
-                                indices = np.random.choice(range(len(all_train_images)), train_size, replace=True)
-                            else:
-                                # Otherwise, sample without replacement from remaining images
-                                indices = np.random.choice(available_indices, train_size, replace=False)
-                        
-                        # Create the subset
-                        subset_images = [all_train_images[i] for i in indices]
-                        subset_masks = [all_train_masks[i] for i in indices]
-                        subset_labels = [all_train_labels[i] for i in indices]
-                        
-                        # Create model
-                        model = None
-                        try:
-                            model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
-                            
-                            # Update progress bar description with current details
-                            pbar.set_description(f"Size: {train_size} | Subset: {subset_idx+1}/{num_subsets}")
-                            
-                            # Evaluate model using the helper method
-                            metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
-                                model,
-                                (subset_images, subset_masks, subset_labels),
-                                (val_prediction_data, val_gt_masks),
-                                return_predictions=True
-                            )
-                            
-                            # Add metadata
-                            metrics['fold'] = fold_idx
-                            metrics['subset'] = subset_idx
-                            metrics['train_size'] = train_size
-                            subset_metrics.append(metrics)
-                            
-                            # Update progress bar with F1 score
-                            pbar.set_postfix({"F1": f"{metrics.get('mask_f1', 0):.4f}"})
-                            
-                            # Save precision-recall curve for this fold and subset
-                            self._save_pr_curve(
-                                val_gt_masks, val_pred_masks, val_pred_probs,
-                                f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
-                                f"{fold_idx}_{subset_idx}"
-                            )
-                        finally:
-                            # Use dedicated cleanup helper
-                            self._cleanup_model(model)
-                            
-                            # Update progress bar
-                            pbar.update(1)
-                    
-                    # Aggregate metrics across subsets
+                    pbar.update(1)
+                    if metrics:
+                        pbar.set_postfix({"F1": f"{metrics.get('mask_f1', 0):.4f}"})
+        
+        # Aggregate metrics for each training size
+        final_metrics = {}
+        for train_size, metrics_list in training_size_metrics.items():
+            if metrics_list:
+                # Group by fold and subset
+                subsets_by_fold = defaultdict(list)
+                for m in metrics_list:
+                    subsets_by_fold[m['fold']].append(m)
+                
+                # Aggregate subsets for each fold
+                fold_metrics = []
+                for fold_idx, subset_metrics in subsets_by_fold.items():
                     if subset_metrics:
-                        avg_metrics = self._aggregate_subset_metrics(subset_metrics)
-                        avg_metrics['fold'] = fold_idx
-                        avg_metrics['train_size'] = train_size
-                        training_size_metrics[train_size].append(avg_metrics)
-            
-            # Aggregate metrics across folds for each training size
-            final_metrics = {}
-            for train_size, metrics_list in training_size_metrics.items():
-                if metrics_list:
-                    final_metrics[train_size] = self._aggregate_fold_metrics(metrics_list)
-            
-            # Save aggregated metrics
-            self._save_training_size_metrics(dataset_name, embedding_name, classifier_name, final_metrics)
-            
-            # Plot learning curve
-            self._plot_learning_curve(dataset_name, embedding_name, classifier_name, final_metrics)
-            
-            return final_metrics
+                        avg_fold_metrics = self._aggregate_subset_metrics(subset_metrics)
+                        avg_fold_metrics['fold'] = fold_idx
+                        avg_fold_metrics['train_size'] = train_size
+                        fold_metrics.append(avg_fold_metrics)
+                
+                # Aggregate metrics across folds
+                if fold_metrics:
+                    final_metrics[train_size] = self._aggregate_fold_metrics(fold_metrics)
+        
+        # Save aggregated metrics
+        self._save_training_size_metrics(dataset_name, embedding_name, classifier_name, final_metrics)
+        
+        # Plot learning curve
+        self._plot_learning_curve(dataset_name, embedding_name, classifier_name, final_metrics)
+        
+        return final_metrics
 
     def _aggregate_subset_metrics(self, subset_metrics):
         """Aggregate metrics across subsets by taking the mean"""
