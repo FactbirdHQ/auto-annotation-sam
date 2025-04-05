@@ -11,6 +11,7 @@ from sklearn.model_selection import ParameterGrid
 from scipy import stats
 import logging
 import concurrent.futures
+from pathlib import Path
 
 from src.master.report_generator import SegmentationReportGenerator
 from src.master.evaluate import evaluate_binary_masks, plot_precision_recall_curve, plot_threshold_vs_metrics
@@ -1325,14 +1326,23 @@ class AblationStudy:
         plt.close(threshold_curve)
 
 
+def get_project_root():
+    # Path to the directory containing the script being run
+    current_file = Path(os.path.abspath(__file__))
+    # Go up from src/master/script.py to reach the project root
+    return current_file.parent.parent.parent
+
+# Create configuration with proper paths
 def create_default_config():
-    """Create a default configuration for ablation study"""
+    project_root = get_project_root()
+    processed_data_dir = project_root / "data" / "processed"
+    
     config = {
         'dataset_paths': {
-            'meatballs': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/meatballs',
-            'cans': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/cans',
-            'doughs': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/doughs',
-            'bottles': 'C:/Users/gtoft/OneDrive/DTU/4_Semester_AS/Master_Thesis/data/sam_inference/processed_data/bottles',
+            'meatballs': str(processed_data_dir / 'meatballs'),
+            'cans': str(processed_data_dir / 'cans'),
+            'doughs': str(processed_data_dir / 'doughs'),
+            'bottles': str(processed_data_dir / 'bottles'),
         },
         'class_ids': {
             'meatballs': 1,
@@ -1342,7 +1352,7 @@ def create_default_config():
         },
         'embeddings': ['CLIP', 'HOG', 'ResNet18'],
         'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
-        'output_dir': './ablation_results',
+        'output_dir': str(project_root / 'ablation_results'),
         'k_folds': 5,
         'hyperparameter_study': {
             'datasets': ['meatballs', 'cans', 'doughs', 'bottles'],
