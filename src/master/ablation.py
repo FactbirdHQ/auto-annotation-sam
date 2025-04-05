@@ -205,7 +205,32 @@ class AblationStudy:
             return aggregated_metrics, all_pred_masks, all_pred_probs
         else:
             return aggregated_metrics
+    
+    def _evaluate_config(self, combo_idx, param_combinations):
+        """Worker function to evaluate a specific hyperparameter configuration"""
+        emb_config, cls_config = param_combinations[combo_idx]
+        try:
+            metrics, model = self._create_and_evaluate_model(
+                self.current_dataset, self.current_embedding, self.current_classifier,
+                emb_config, cls_config
+            )
             
+            # Clean up model regardless of result
+            if model is not None:
+                self._cleanup_model(model)
+            
+            # Return results if evaluation was successful
+            if metrics is not None:
+                return {
+                    'embedding_config': emb_config,
+                    'classifier_config': cls_config,
+                    'metrics': metrics,
+                    'combo_idx': combo_idx
+                }
+            return None
+        except Exception as e:
+            self.logger.error(f"Error evaluating config {combo_idx}: {e}")
+            return None
 
     
     def create_model(self, embedding_name, classifier_name, embedding_config=None, classifier_config=None):
@@ -511,6 +536,59 @@ class AblationStudy:
         
         return comparison_results
     
+    # First, add this as a new method to the AblationStudy class
+    def _process_fold(self, fold_idx, dataset_name, embedding_name, classifier_name, 
+                    embedding_config, classifier_config):
+        """Worker function to process a specific fold during cross-validation"""
+        if fold_idx == 0:
+            return None  # Skip fold 0 (reserved for hyperparameter tuning)
+            
+        self.logger.info(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
+        
+        # Create model for this fold
+        model = None
+        try:
+            # Get training and validation data
+            train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
+            train_images, train_masks, train_labels = train_data
+            val_prediction_data, val_gt_masks = val_data
+            
+            if not train_images:
+                self.logger.info(f"No training data for fold {fold_idx+1}")
+                return None
+                
+            if not val_prediction_data:
+                self.logger.info(f"No validation data for fold {fold_idx+1}")
+                return None
+                
+            # Create and evaluate model
+            model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
+            
+            # Evaluate model using the helper method
+            metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
+                model,
+                (train_images, train_masks, train_labels),
+                (val_prediction_data, val_gt_masks),
+                return_predictions=True
+            )
+            
+            # Add fold index to metrics
+            metrics['fold'] = fold_idx
+            
+            # Save precision-recall curve for this fold
+            self._save_pr_curve(val_gt_masks, val_pred_masks, val_pred_probs, 
+                            dataset_name, embedding_name, classifier_name, fold_idx)
+            
+            return metrics
+            
+        except Exception as e:
+            self.logger.error(f"Error evaluating {embedding_name}-{classifier_name} on fold {fold_idx}: {e}")
+            return None
+        finally:
+            # Use dedicated cleanup helper
+            self._cleanup_model(model)
+
+    # Then modify the perform_cross_validation method
     def perform_cross_validation(self, dataset_name, embedding_name, classifier_name, 
                                 embedding_config=None, classifier_config=None):
         """
@@ -534,56 +612,6 @@ class AblationStudy:
         # Get k-fold data loaders
         fold_dataloaders = dataset_manager.get_kfold_dataloaders(k=self.k_folds, batch_size=1)
         
-        # Define worker function for each fold
-        def process_fold(fold_idx):
-            if fold_idx == 0:
-                return None  # Skip fold 0 (reserved for hyperparameter tuning)
-                
-            print(f"\nProcessing fold {fold_idx+1}/{self.k_folds}")
-            
-            # Create model for this fold
-            model = None
-            try:
-                # Get training and validation data
-                train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
-                train_images, train_masks, train_labels = train_data
-                val_prediction_data, val_gt_masks = val_data
-                
-                if not train_images:
-                    print(f"No training data for fold {fold_idx+1}")
-                    return None
-                    
-                if not val_prediction_data:
-                    print(f"No validation data for fold {fold_idx+1}")
-                    return None
-                    
-                # Create and evaluate model
-                model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
-                
-                # Evaluate model using the helper method
-                metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
-                    model,
-                    (train_images, train_masks, train_labels),
-                    (val_prediction_data, val_gt_masks),
-                    return_predictions=True
-                )
-                
-                # Add fold index to metrics
-                metrics['fold'] = fold_idx
-                
-                # Save precision-recall curve for this fold
-                self._save_pr_curve(val_gt_masks, val_pred_masks, val_pred_probs, 
-                                dataset_name, embedding_name, classifier_name, fold_idx)
-                
-                return metrics
-                
-            except Exception as e:
-                print(f"Error evaluating {embedding_name}-{classifier_name} on fold {fold_idx}: {e}")
-                return None
-            finally:
-                # Use dedicated cleanup helper
-                self._cleanup_model(model)
-        
         # Track metrics across all folds
         fold_metrics = []
         
@@ -591,7 +619,8 @@ class AblationStudy:
         with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all folds for processing (skip fold 0)
             future_to_fold = {
-                executor.submit(process_fold, fold_idx): fold_idx 
+                executor.submit(self._process_fold, fold_idx, dataset_name, embedding_name, 
+                            classifier_name, embedding_config, classifier_config): fold_idx 
                 for fold_idx in range(1, self.k_folds)
             }
             
@@ -746,6 +775,11 @@ class AblationStudy:
         Returns:
             Dictionary with best configuration and metrics
         """
+        # Store current dataset, embedding and classifier names for the worker function
+        self.current_dataset = dataset_name
+        self.current_embedding = embedding_name
+        self.current_classifier = classifier_name
+        
         # Get parameter grids
         embedding_grid = grid_config.get(embedding_name, {})
         classifier_grid = grid_config.get(classifier_name, {})
@@ -768,32 +802,6 @@ class AblationStudy:
         print(f"Grid search with {len(embedding_param_grid)} embedding configs and {len(classifier_param_grid)} classifier configs")
         print(f"Total configurations to try: {total_configs}")
         
-        # Create a worker function for concurrent execution
-        def evaluate_config(combo_idx):
-            emb_config, cls_config = param_combinations[combo_idx]
-            try:
-                metrics, model = self._create_and_evaluate_model(
-                    dataset_name, embedding_name, classifier_name,
-                    emb_config, cls_config
-                )
-                
-                # Clean up model regardless of result
-                if model is not None:
-                    self._cleanup_model(model)
-                
-                # Return results if evaluation was successful
-                if metrics is not None:
-                    return {
-                        'embedding_config': emb_config,
-                        'classifier_config': cls_config,
-                        'metrics': metrics,
-                        'combo_idx': combo_idx
-                    }
-                return None
-            except Exception as e:
-                print(f"Error evaluating config {combo_idx}: {e}")
-                return None
-        
         # Track best configuration and performance
         best_config = {'embedding': {}, 'classifier': {}}
         best_f1 = -1
@@ -803,7 +811,7 @@ class AblationStudy:
         with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all jobs
             future_to_idx = {
-                executor.submit(evaluate_config, i): i
+                executor.submit(self._evaluate_config, i, param_combinations): i
                 for i in range(total_configs)
             }
             
@@ -827,14 +835,99 @@ class AblationStudy:
                             }
                             pbar.set_postfix({"Best F1": f"{best_f1:.4f}"})
         
+        # Clean up after grid search
+        self.current_dataset = None
+        self.current_embedding = None
+        self.current_classifier = None
+        
         # Save all grid search results
         self._save_grid_search_results(dataset_name, embedding_name, classifier_name, all_results)
         
         return best_config
     
+    # First, add this as a new method to the AblationStudy class
+    def _process_fold_and_size(self, task, dataset_name, embedding_name, classifier_name,
+                            embedding_config, classifier_config):
+        """Worker function to process a specific fold and training size"""
+        fold_idx, train_size, subset_idx = task
+        
+        # Get training and validation data
+        train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
+        all_train_images, all_train_masks, all_train_labels = train_data
+        val_prediction_data, val_gt_masks = val_data
+        
+        if not all_train_images:
+            self.logger.info(f"No training data for fold {fold_idx}")
+            return None
+        
+        # Calculate information content (number of GT masks) for each training image
+        image_info_scores = []
+        for i, masks in enumerate(all_train_masks):
+            # Count the number of ground truth masks (where label is 1)
+            gt_mask_count = sum(1 for j, label in enumerate(all_train_labels[i]) 
+                            if label == 1)
+            image_info_scores.append((i, gt_mask_count))
+        
+        # Sort by information content (highest number of GT masks first)
+        image_info_scores.sort(key=lambda x: x[1], reverse=True)
+        sorted_indices = [item[0] for item in image_info_scores]
+        
+        # For the first subset, always use the most informative images
+        if subset_idx == 0:
+            # Take the top train_size most informative images
+            indices = sorted_indices[:train_size]
+        else:
+            # For additional subsets, select randomly from remaining images
+            available_indices = list(set(range(len(all_train_images))) - set(sorted_indices[:train_size]))
+            if len(available_indices) < train_size:
+                # If not enough remaining images, use random sampling with replacement
+                indices = np.random.choice(range(len(all_train_images)), train_size, replace=True)
+            else:
+                # Otherwise, sample without replacement from remaining images
+                indices = np.random.choice(available_indices, train_size, replace=False)
+        
+        # Create the subset
+        subset_images = [all_train_images[i] for i in indices]
+        subset_masks = [all_train_masks[i] for i in indices]
+        subset_labels = [all_train_labels[i] for i in indices]
+        
+        # Create model
+        model = None
+        try:
+            model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
+            
+            # Evaluate model using the helper method
+            metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
+                model,
+                (subset_images, subset_masks, subset_labels),
+                (val_prediction_data, val_gt_masks),
+                return_predictions=True
+            )
+            
+            # Add metadata
+            metrics['fold'] = fold_idx
+            metrics['subset'] = subset_idx
+            metrics['train_size'] = train_size
+            
+            # Save precision-recall curve for this fold and subset
+            self._save_pr_curve(
+                val_gt_masks, val_pred_masks, val_pred_probs,
+                f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
+                f"{fold_idx}_{subset_idx}"
+            )
+            
+            return metrics
+        except Exception as e:
+            self.logger.error(f"Error processing fold {fold_idx}, size {train_size}, subset {subset_idx}: {e}")
+            return None
+        finally:
+            # Use dedicated cleanup helper
+            self._cleanup_model(model)
+
+    # Then modify the perform_training_size_analysis method
     def perform_training_size_analysis(self, dataset_name, embedding_name, classifier_name, 
-                                     embedding_config=None, classifier_config=None,
-                                     training_sizes=None):
+                                    embedding_config=None, classifier_config=None,
+                                    training_sizes=None):
         """
         Perform analysis of training set size using concurrent execution
         
@@ -862,83 +955,6 @@ class AblationStudy:
         # Track metrics across all folds and training sizes
         training_size_metrics = {size: [] for size in training_sizes}
         
-        # Define a worker function for each fold and training size
-        def process_fold_and_size(task):
-            fold_idx, train_size, subset_idx = task
-            
-            # Get training and validation data
-            train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
-            all_train_images, all_train_masks, all_train_labels = train_data
-            val_prediction_data, val_gt_masks = val_data
-            
-            if not all_train_images:
-                print(f"No training data for fold {fold_idx}")
-                return None
-            
-            # Calculate information content (number of GT masks) for each training image
-            image_info_scores = []
-            for i, masks in enumerate(all_train_masks):
-                # Count the number of ground truth masks (where label is 1)
-                gt_mask_count = sum(1 for j, label in enumerate(all_train_labels[i]) 
-                                  if label == 1)
-                image_info_scores.append((i, gt_mask_count))
-            
-            # Sort by information content (highest number of GT masks first)
-            image_info_scores.sort(key=lambda x: x[1], reverse=True)
-            sorted_indices = [item[0] for item in image_info_scores]
-            
-            # For the first subset, always use the most informative images
-            if subset_idx == 0:
-                # Take the top train_size most informative images
-                indices = sorted_indices[:train_size]
-            else:
-                # For additional subsets, select randomly from remaining images
-                available_indices = list(set(range(len(all_train_images))) - set(sorted_indices[:train_size]))
-                if len(available_indices) < train_size:
-                    # If not enough remaining images, use random sampling with replacement
-                    indices = np.random.choice(range(len(all_train_images)), train_size, replace=True)
-                else:
-                    # Otherwise, sample without replacement from remaining images
-                    indices = np.random.choice(available_indices, train_size, replace=False)
-            
-            # Create the subset
-            subset_images = [all_train_images[i] for i in indices]
-            subset_masks = [all_train_masks[i] for i in indices]
-            subset_labels = [all_train_labels[i] for i in indices]
-            
-            # Create model
-            model = None
-            try:
-                model = self.create_model(embedding_name, classifier_name, embedding_config, classifier_config)
-                
-                # Evaluate model using the helper method
-                metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
-                    model,
-                    (subset_images, subset_masks, subset_labels),
-                    (val_prediction_data, val_gt_masks),
-                    return_predictions=True
-                )
-                
-                # Add metadata
-                metrics['fold'] = fold_idx
-                metrics['subset'] = subset_idx
-                metrics['train_size'] = train_size
-                
-                # Save precision-recall curve for this fold and subset
-                self._save_pr_curve(
-                    val_gt_masks, val_pred_masks, val_pred_probs,
-                    f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
-                    f"{fold_idx}_{subset_idx}"
-                )
-                
-                return metrics
-            except Exception as e:
-                print(f"Error processing fold {fold_idx}, size {train_size}, subset {subset_idx}: {e}")
-                return None
-            finally:
-                # Use dedicated cleanup helper
-                self._cleanup_model(model)
-        
         # Create list of all tasks
         tasks = []
         
@@ -956,7 +972,8 @@ class AblationStudy:
         with concurrent.futures.ProcessPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all tasks
             future_to_task = {
-                executor.submit(process_fold_and_size, task): task
+                executor.submit(self._process_fold_and_size, task, dataset_name, embedding_name, 
+                            classifier_name, embedding_config, classifier_config): task
                 for task in tasks
             }
             
