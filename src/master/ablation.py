@@ -21,6 +21,8 @@ from src.master.model import (
     CLIPEmbedding, HoGEmbedding, ResNET18Embedding
 )
 
+
+
 class AblationStudy:
     def __init__(self, config):
         """
@@ -41,6 +43,11 @@ class AblationStudy:
         self.results = defaultdict(dict)
         self.output_dir = config.get('output_dir', 'ablation_results')
         self.k_folds = config.get('k_folds', 5)
+        
+        # Initialize tracking variables for hyperparameter search
+        self.current_dataset = None
+        self.current_embedding = None
+        self.current_classifier = None
         
         # Create output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
@@ -75,19 +82,41 @@ class AblationStudy:
         self.max_workers = config.get('max_workers', os.cpu_count())
         self.logger.info(f"Using up to {self.max_workers} concurrent workers")
         
-        # Initialize embedding and classifier factories
+        # Initialize embedding and classifier factories using method references
+        # instead of lambda functions
         self.embedding_factory = {
-            'CLIP': lambda cfg: CLIPEmbedding(cfg),
-            'HOG': lambda cfg: HoGEmbedding(cfg),
-            'ResNet18': lambda cfg: ResNET18Embedding(cfg)
+            'CLIP': self._create_clip_embedding,
+            'HOG': self._create_hog_embedding,
+            'ResNet18': self._create_resnet18_embedding
         }
         
         self.classifier_factory = {
-            'KNN': lambda cfg, emb: KNNClassifier(cfg, emb),
-            'SVM': lambda cfg, emb: SVMClassifier(cfg, emb),
-            'RF': lambda cfg, emb: RandomForestClassifier(cfg, emb),
-            'LR': lambda cfg, emb: LogRegClassifier(cfg, emb)
+            'KNN': self._create_knn_classifier,
+            'SVM': self._create_svm_classifier,
+            'RF': self._create_rf_classifier,
+            'LR': self._create_lr_classifier
         }
+    
+    def _create_clip_embedding(self, cfg):
+        return CLIPEmbedding(cfg)
+
+    def _create_hog_embedding(self, cfg):
+        return HoGEmbedding(cfg)
+
+    def _create_resnet18_embedding(self, cfg):
+        return ResNET18Embedding(cfg)
+
+    def _create_knn_classifier(self, cfg, emb):
+        return KNNClassifier(cfg, emb)
+
+    def _create_svm_classifier(self, cfg, emb):
+        return SVMClassifier(cfg, emb)
+
+    def _create_rf_classifier(self, cfg, emb):
+        return RandomForestClassifier(cfg, emb)
+
+    def _create_lr_classifier(self, cfg, emb):
+        return LogRegClassifier(cfg, emb)
     
     def load_datasets(self):
         """
