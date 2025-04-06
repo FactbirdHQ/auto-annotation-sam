@@ -435,7 +435,7 @@ class AblationStudy:
         # Get ground truth masks for validation
         val_gt_masks = []
         for batch in val_loader:
-            batch_gt_masks = batch['gt_binary_mask']
+            batch_gt_masks = batch['gt_binary_masks']
             batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
             
             for i, has_gt in enumerate(batch_has_gt):
