@@ -11,7 +11,9 @@ from sklearn.model_selection import ParameterGrid
 from scipy import stats
 import logging
 import concurrent.futures
+import torch
 from pathlib import Path
+import traceback
 
 from src.master.report_generator import SegmentationReportGenerator
 from src.master.evaluate import evaluate_binary_masks, plot_precision_recall_curve, plot_threshold_vs_metrics
@@ -66,7 +68,7 @@ class AblationStudy:
         
         # Console handler for important info
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(logging.DEBUG)
         
         # Format for logs
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -79,8 +81,12 @@ class AblationStudy:
         self.logger.info("Initializing Ablation Study")
 
         # Set the maximum number of workers for concurrent execution
-        self.max_workers = config.get('max_workers', os.cpu_count())
+        self.max_workers = 4 # config.get('max_workers', os.cpu_count())
         self.logger.info(f"Using up to {self.max_workers} concurrent workers")
+
+        # Set up CUDA device if available
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.logger.info(f"Using device: {self.device}")
         
         # Initialize embedding and classifier factories using method references
         # instead of lambda functions
@@ -98,13 +104,13 @@ class AblationStudy:
         }
     
     def _create_clip_embedding(self, cfg):
-        return CLIPEmbedding(cfg)
+        return CLIPEmbedding(cfg, device=self.device)
+
+    def _create_resnet18_embedding(self, cfg):
+        return ResNET18Embedding(cfg, device=self.device)
 
     def _create_hog_embedding(self, cfg):
         return HoGEmbedding(cfg)
-
-    def _create_resnet18_embedding(self, cfg):
-        return ResNET18Embedding(cfg)
 
     def _create_knn_classifier(self, cfg, emb):
         return KNNClassifier(cfg, emb)
@@ -150,7 +156,6 @@ class AblationStudy:
         Core model evaluation logic used across different analysis methods
         """
         train_images, train_masks, train_labels = train_data
-        val_prediction_data, val_gt_masks = val_data
         
         # Time the training process
         start_time = time.perf_counter()
@@ -167,14 +172,20 @@ class AblationStudy:
         num_predictions = 0
         
         # Process each validation sample with immediate evaluation
-        for i, (image, candidate_masks) in enumerate(val_prediction_data):
+        for i, (image, candidate_masks, val_gt_masks) in enumerate(val_data):
             if not candidate_masks:
                 continue
                 
             # Get ground truth masks for this image
             # Assuming val_gt_masks is organized the same way as val_prediction_data
             image_gt_masks = val_gt_masks[i] if i < len(val_gt_masks) else []
-                
+
+            classifier_name, _ = model.get_types()
+
+            self.logger.debug(f"Making predictions with {classifier_name} classifier")
+            self.logger.debug(f"Input image shape: {image.shape if hasattr(image, 'shape') else 'unknown'}")
+            self.logger.debug(f"Number of candidate masks: {len(candidate_masks)}")
+                            
             # Time the prediction process for this sample
             start_time = time.perf_counter()
             pred_results, probs = model.predict(image, candidate_masks)
@@ -182,6 +193,11 @@ class AblationStudy:
             total_inference_time += inference_time
             num_predictions += 1
             
+            # After making predictions
+            self.logger.debug(f"Prediction results type: {type(pred_results)}")
+            self.logger.debug(f"Prediction results length: {len(pred_results)}")
+            self.logger.debug(f"Probabilities type: {type(probs)}")
+            self.logger.debug(f"Probabilities length: {len(probs)}")
             # Extract positive predictions
             image_pred_masks = []
             image_pred_probs = []
@@ -196,7 +212,7 @@ class AblationStudy:
             all_pred_probs.extend(image_pred_probs)
             
             # Evaluate this image immediately
-            if image_gt_masks and image_pred_masks:
+            if len(image_gt_masks) > 0 and len(image_pred_masks) > 0:
                 image_metrics = evaluate_binary_masks(image_gt_masks, image_pred_masks)
                 all_metrics.append(image_metrics)
         
@@ -332,17 +348,6 @@ class AblationStudy:
         train_images, train_masks, train_labels = dataset_manager.get_training_data(train_loader)
         val_prediction_data = dataset_manager.get_prediction_data(val_loader)
         
-        # Get ground truth masks for validation
-        val_gt_masks = []
-        for batch in val_loader:
-            batch_gt_masks = batch['gt_binary_masks']
-            batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
-            
-            for i, has_gt in enumerate(batch_has_gt):
-                if has_gt:
-                    gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
-                    val_gt_masks.append(gt_mask)
-        
         # Create and evaluate model
         model = None
         metrics = None
@@ -352,7 +357,7 @@ class AblationStudy:
             # Evaluate model
             metrics = self._evaluate_model(model, 
                                         (train_images, train_masks, train_labels),
-                                        (val_prediction_data, val_gt_masks))
+                                        val_prediction_data)
             
             mem_after = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
             self.logger.info(f"Memory after evaluation: {mem_after:.2f} MB (diff: {mem_after-mem_before:.2f} MB)")
@@ -360,6 +365,7 @@ class AblationStudy:
             return metrics, model
         except Exception as e:
             self.logger.error(f"Error evaluating {embedding_name}-{classifier_name} on {dataset_name}: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             if model is not None:
                 self._cleanup_model(model)
             return None, None
@@ -432,18 +438,7 @@ class AblationStudy:
         # Get validation data
         val_prediction_data = dataset_manager.get_prediction_data(val_loader, return_combined)
         
-        # Get ground truth masks for validation
-        val_gt_masks = []
-        for batch in val_loader:
-            batch_gt_masks = batch['gt_binary_masks']
-            batch_has_gt = batch.get('has_gt', [True] * len(batch_gt_masks))
-            
-            for i, has_gt in enumerate(batch_has_gt):
-                if has_gt:
-                    gt_mask = batch_gt_masks[i].numpy() if hasattr(batch_gt_masks[i], 'numpy') else batch_gt_masks[i]
-                    val_gt_masks.append(gt_mask)
-        
-        return (train_images, train_masks, train_labels), (val_prediction_data, val_gt_masks)
+        return (train_images, train_masks, train_labels), val_prediction_data
     
     def run_pipeline_comparison(self):
         """
@@ -521,7 +516,6 @@ class AblationStudy:
                         )
                         
                         train_images, train_masks, train_labels = train_data
-                        val_prediction_data, val_gt_masks = val_data
                         
                         if not train_images:
                             self.logger.debug(f"  No training data for fold {fold_idx}")
@@ -536,7 +530,7 @@ class AblationStudy:
                             metrics = self._evaluate_model(
                                 model,
                                 (train_images, train_masks, train_labels),
-                                (val_prediction_data, val_gt_masks)
+                                val_data
                             )
                             
                             # Add fold index to metrics
@@ -580,13 +574,13 @@ class AblationStudy:
             # Get training and validation data
             train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
             train_images, train_masks, train_labels = train_data
-            val_prediction_data, val_gt_masks = val_data
+            val_gt_masks = [item[2] for item in val_data]  # Get gt_masks from each tuple
             
             if not train_images:
                 self.logger.info(f"No training data for fold {fold_idx+1}")
                 return None
                 
-            if not val_prediction_data:
+            if not val_data:
                 self.logger.info(f"No validation data for fold {fold_idx+1}")
                 return None
                 
@@ -597,7 +591,7 @@ class AblationStudy:
             metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
                 model,
                 (train_images, train_masks, train_labels),
-                (val_prediction_data, val_gt_masks),
+                val_data,
                 return_predictions=True
             )
             
@@ -883,7 +877,6 @@ class AblationStudy:
         # Get training and validation data
         train_data, val_data = self._get_train_val_data(dataset_name, fold_idx)
         all_train_images, all_train_masks, all_train_labels = train_data
-        val_prediction_data, val_gt_masks = val_data
         
         if not all_train_images:
             self.logger.info(f"No training data for fold {fold_idx}")
@@ -929,7 +922,7 @@ class AblationStudy:
             metrics, val_pred_masks, val_pred_probs = self._evaluate_model(
                 model,
                 (subset_images, subset_masks, subset_labels),
-                (val_prediction_data, val_gt_masks),
+                val_data,
                 return_predictions=True
             )
             
@@ -939,6 +932,8 @@ class AblationStudy:
             metrics['train_size'] = train_size
             
             # Save precision-recall curve for this fold and subset
+            val_gt_masks = [item[2] for item in val_data]  # Get gt_masks from each tuple
+
             self._save_pr_curve(
                 val_gt_masks, val_pred_masks, val_pred_probs,
                 f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
@@ -1386,9 +1381,9 @@ def create_default_config():
     config = {
         'dataset_paths': {
             'meatballs': str(processed_data_dir / 'meatballs'),
-            'cans': str(processed_data_dir / 'cans'),
-            'doughs': str(processed_data_dir / 'doughs'),
-            'bottles': str(processed_data_dir / 'bottles'),
+            # 'cans': str(processed_data_dir / 'cans'),
+            # 'doughs': str(processed_data_dir / 'doughs'),
+            # 'bottles': str(processed_data_dir / 'bottles'),
         },
         'class_ids': {
             'meatballs': 1,
@@ -1397,7 +1392,7 @@ def create_default_config():
             'bottles': 1,
         },
         'embeddings': ['CLIP', 'HOG', 'ResNet18'],
-        'classifiers': ['KNN', 'SVM', 'RF', 'LR'],
+        'classifiers': ['KNN', 'SVM', 'RF','LR'],
         'output_dir': str(project_root / 'ablation_results'),
         'k_folds': 5,
         'hyperparameter_study': {
