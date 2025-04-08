@@ -1,3 +1,7 @@
+import multiprocessing
+# Set the start method to 'spawn'
+multiprocessing.set_start_method('spawn', force=True)
+
 import os
 import json
 import gc
