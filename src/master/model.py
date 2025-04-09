@@ -10,7 +10,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier as SklearnRF
     
 class Embedding:
     def __init__(self, config=None):
@@ -710,7 +710,7 @@ class RandomForestClassifier(Classifier):
         self.max_depth = self.config.get('max_depth', None)
         self.min_samples_split = self.config.get('min_samples_split', 2)
         
-        self.rf = RandomForestClassifier(
+        self.rf = SklearnRF(
             n_estimators=self.n_estimators,
             max_depth=self.max_depth,
             min_samples_split=self.min_samples_split,
