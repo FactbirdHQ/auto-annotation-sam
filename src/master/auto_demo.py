@@ -8,6 +8,8 @@ import argparse
 from pathlib import Path
 import time
 from tqdm import tqdm
+import sys
+
 
 # Import from the provided files
 from src.master.model import CLIPEmbedding, KNNClassifier
@@ -37,57 +39,68 @@ class AutoAnnotator:
 
     def find_data(self):
         """
-        Find all images and label files in train, val, and test folders
+        Find all images and label files in the dataset structure:
+        - images/Train, images/Validation, images/Test
+        - labels/Train, labels/Validation, labels/Test
         
         Returns:
             Dictionary mapping image paths to label paths (or None if no label exists)
         """
         print("Finding data in input directory...")
         
-        # Look for images and labels in train, val, and test folders
-        subfolders = ["train", "val", "test"]
-        if not any(os.path.exists(self.input_dir / subfolder) for subfolder in subfolders):
-            # If no train/val/test structure, look in root directory
-            subfolders = [""]
+        # Check if we have the main structure with images and labels directories
+        images_dir = self.input_dir / "images"
+        labels_dir = self.input_dir / "labels"
+        
+        if not images_dir.exists():
+            print(f"Warning: Could not find 'images' directory at {images_dir}")
+            return {}
+        
+        # Look for Train, Validation, Test subfolders in images directory
+        subfolders = ["Train", "Validation", "Test"]
+        available_subfolders = [subfolder for subfolder in subfolders if (images_dir / subfolder).exists()]
+        
+        if not available_subfolders:
+            print(f"Warning: Could not find any of {subfolders} subfolders in images directory")
+            return {}
         
         # Collect all image and label files
         image_files = []
         label_files = []
         
-        for subfolder in subfolders:
-            subfolder_path = self.input_dir / subfolder
-            if not os.path.exists(subfolder_path):
-                continue
-                
+        for subfolder in available_subfolders:
             # Find image files in this subfolder
-            images_path = subfolder_path / "images" if (subfolder_path / "images").exists() else subfolder_path
+            images_subfolder_path = images_dir / subfolder
             for ext in ["*.jpg", "*.jpeg", "*.png"]:
-                image_files.extend(glob.glob(str(images_path / ext)))
+                image_files.extend(glob.glob(str(images_subfolder_path / ext)))
             
-            # Find label files in this subfolder
-            labels_path = subfolder_path / "labels" if (subfolder_path / "labels").exists() else subfolder_path
-            label_files.extend(glob.glob(str(labels_path / "*.txt")))
+            # Find label files in this subfolder (if labels directory exists)
+            if labels_dir.exists():
+                labels_subfolder_path = labels_dir / subfolder
+                if labels_subfolder_path.exists():
+                    label_files.extend(glob.glob(str(labels_subfolder_path / "*.txt")))
         
         # Map image files to label files
         data_map = {}
         for image_path in image_files:
-            image_name = os.path.basename(image_path)
-            base_name = os.path.splitext(image_name)[0]
+            image_path = Path(image_path)
+            image_name = image_path.name
+            base_name = image_path.stem
             
-            # Look for corresponding label file
-            label_path = None
-            for l_path in label_files:
-                if os.path.splitext(os.path.basename(l_path))[0] == base_name:
-                    label_path = l_path
-                    break
+            # Determine which subfolder this image is in
+            subfolder = image_path.parent.name  # Should be "Train", "Validation", or "Test"
             
-            data_map[image_path] = label_path
+            # Look for corresponding label file in the matching labels subfolder
+            expected_label_path = labels_dir / subfolder / f"{base_name}.txt"
+            label_path = str(expected_label_path) if expected_label_path.exists() else None
+            
+            data_map[str(image_path)] = label_path
             
             # Track which images have ground truth
             if label_path:
-                self.images_with_gt.append(image_path)
+                self.images_with_gt.append(str(image_path))
             else:
-                self.images_without_gt.append(image_path)
+                self.images_without_gt.append(str(image_path))
         
         print(f"Found {len(data_map)} images - {len(self.images_with_gt)} with labels, {len(self.images_without_gt)} without labels")
         return data_map
@@ -102,44 +115,25 @@ class AutoAnnotator:
         Returns:
             List of binary masks
         """
-        if self.sam_model is None:
-            # Create placeholder masks (for testing without SAM)
-            print("Warning: No SAM model provided, using placeholder masks")
-            return self._generate_placeholder_masks(image)
         
-        # Run SAM inference and convert to binary masks
-        masks = self.sam_model.generate(image)
-        return masks
-    
-    def _generate_placeholder_masks(self, image, num_masks=5):
-        """
-        Generate placeholder masks for testing without SAM
+        # Run SAM inference 
+        masks_info = self.sam_model.generate(image)
         
-        Args:
-            image: Input image array
-            num_masks: Number of masks to generate
-            
-        Returns:
-            List of binary masks
-        """
-        height, width = image.shape[:2]
-        masks = []
+        # Convert the SAM2 output to binary masks
+        binary_masks = []
         
-        for _ in range(num_masks):
-            # Create a random rectangle mask
-            mask = np.zeros((height, width), dtype=np.uint8)
-            
-            # Random rectangle parameters
-            x1 = np.random.randint(0, width // 2)
-            y1 = np.random.randint(0, height // 2)
-            x2 = np.random.randint(width // 2, width)
-            y2 = np.random.randint(height // 2, height)
-            
-            # Draw the rectangle
-            cv2.rectangle(mask, (x1, y1), (x2, y2), 1, -1)
-            masks.append(mask)
+        # Check if masks_info is a dictionary or list of dictionaries
+        if isinstance(masks_info, dict):
+            # Handle single mask case
+            if 'segmentation' in masks_info:
+                binary_masks.append(masks_info['segmentation'].astype(np.uint8))
+        elif isinstance(masks_info, list):
+            # Handle list of masks case
+            for mask_info in masks_info:
+                if isinstance(mask_info, dict) and 'segmentation' in mask_info:
+                    binary_masks.append(mask_info['segmentation'].astype(np.uint8))
         
-        return masks
+        return binary_masks
 
     def train_model(self):
         """
@@ -157,20 +151,23 @@ class AutoAnnotator:
         
         for image_path in tqdm(self.images_with_gt, desc="Preparing training data"):
             try:
+                # Convert string path to Path object
+                image_path_obj = Path(image_path)
+                
                 # Load image
                 image = np.array(Image.open(image_path).convert("RGB"))
                 
-                # Load ground truth masks from corresponding label file
-                label_path = image_path.parent.parent / "labels" / f"{os.path.splitext(os.path.basename(image_path))[0]}.txt"
-                if not os.path.exists(label_path):
-                    # Try alternate path formats
-                    alt_path = Path(str(image_path).replace("images", "labels").replace(".jpg", ".txt").replace(".png", ".txt"))
-                    if os.path.exists(alt_path):
-                        label_path = alt_path
-                    else:
-                        continue
+                # Extract subfolder name (Train, Validation, Test)
+                subfolder = image_path_obj.parent.name
                 
-                gt_masks = load_yolo_masks_as_binary_list(label_path, image.shape[1], image.shape[0])
+                # Construct the correct path to the label file
+                label_path = self.input_dir / "labels" / subfolder / f"{image_path_obj.stem}.txt"
+                
+                if not label_path.exists():
+                    print(f"Warning: Could not find label file at {label_path}")
+                    continue
+                
+                gt_masks = load_yolo_masks_as_binary_list(str(label_path), image.shape[1], image.shape[0])
                 if not gt_masks:
                     continue
                     
@@ -288,21 +285,24 @@ class AutoAnnotator:
                     predicted_masks, predicted_probs = sort_masks(predicted_masks, predicted_probs)
                     
                     # Determine output path for the label file
-                    image_rel_path = os.path.relpath(image_path, self.input_dir)
-                    
-                    # Replace 'images' with 'labels' in the path
-                    if "images" in image_rel_path:
-                        label_rel_path = image_rel_path.replace("images", "labels")
-                    else:
-                        # If no 'images' folder, use the same structure but with .txt extension
-                        label_rel_path = os.path.splitext(image_rel_path)[0] + ".txt"
-                    
-                    # Ensure we have the correct extension
-                    label_rel_path = os.path.splitext(label_rel_path)[0] + ".txt"
-                    
-                    # Full output path
-                    output_path = self.output_dir / label_rel_path
-                    
+                    image_path_obj = Path(image_path)
+                    image_rel_path = image_path_obj.relative_to(self.input_dir)
+
+                    # Extract subfolder (Train, Validation, Test)
+                    subfolder = image_path_obj.parent.name
+
+                    # Construct the correct output path
+                    output_dir_path = self.output_dir / "labels" / subfolder
+
+                    # Check if the directory exists - if not, this is an error
+                    if not output_dir_path.exists():
+                        print(f"Error: Output directory {output_dir_path} does not exist. Please check your dataset structure.")
+                        print(f"Skipping annotation for {image_path}")
+                        continue
+
+                    # Create the output path
+                    output_path = output_dir_path / f"{image_path_obj.stem}.txt"
+
                     # Save the predicted masks as YOLO format
                     self.save_masks_as_yolo(predicted_masks, image.shape[1], image.shape[0], output_path)
                     annotated_count += 1
@@ -410,6 +410,83 @@ class AutoAnnotator:
                 "annotated_images": 0
             }
 
+def convert_polygon_to_bbox(polygon_file, output_file=None):
+    """
+    Convert YOLO polygon format to Ultralytics YOLO detection format
+    
+    YOLO polygon: class_id x1 y1 x2 y2 x3 y3 ... xn yn
+    Ultralytics YOLO: class_id x_center y_center width height
+    (All values normalized between 0-1)
+    """
+    if output_file is None:
+        output_file = polygon_file
+        
+    with open(polygon_file, 'r') as f:
+        lines = f.readlines()
+    
+    bbox_lines = []
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) < 5:  # Need at least class_id and two points
+            continue
+            
+        class_id = parts[0]
+        # Extract all x,y coordinates
+        coords = [float(coord) for coord in parts[1:]]
+        
+        # Group into x,y pairs
+        points = np.array(coords).reshape(-1, 2)
+        
+        # Calculate bounding box from polygon points
+        min_x = np.min(points[:, 0])
+        min_y = np.min(points[:, 1])
+        max_x = np.max(points[:, 0])
+        max_y = np.max(points[:, 1])
+        
+        # Convert to YOLO format (center_x, center_y, width, height)
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+        width = max_x - min_x
+        height = max_y - min_y
+        
+        bbox_lines.append(f"{class_id} {center_x:.6f} {center_y:.6f} {width:.6f} {height:.6f}\n")
+    
+    # Write the converted lines to the output file
+    with open(output_file, 'w') as f:
+        f.writelines(bbox_lines)
+    
+    return True
+
+def convert_all_label_files(labels_dir, backup=False):
+    """Convert all label files in a directory from polygon to bbox format"""
+    if isinstance(labels_dir, str):
+        labels_dir = Path(labels_dir)
+    
+    # Get all subdirectories (Train, Validation, Test)
+    subfolders = [d for d in labels_dir.iterdir() if d.is_dir()]
+    
+    count = 0
+    for subfolder in subfolders:
+        polygon_files = glob.glob(str(subfolder / "*.txt"))
+        
+        for polygon_file in polygon_files:
+            # Use the same filename for output
+            polygon_file_path = Path(polygon_file)
+            
+            # Create backup of original file if requested
+            if backup:
+                backup_file = str(polygon_file) + '.polygon_backup'
+                if not os.path.exists(backup_file):
+                    os.rename(polygon_file, backup_file)
+                    # Now convert from backup to original filename
+                    if convert_polygon_to_bbox(backup_file, polygon_file):
+                        count += 1
+            else:
+                # Convert in place without backup
+                if convert_polygon_to_bbox(polygon_file):
+                    count += 1
+    
+    return count
 
 def main():
     """Main function to run the auto-annotator"""
@@ -417,22 +494,27 @@ def main():
     parser.add_argument("--input_dir", required=True, help="Path to the input directory containing YOLO segmentation data")
     parser.add_argument("--output_dir", help="Path to save the annotations (defaults to same as input_dir)")
     parser.add_argument("--visualize", action="store_true", help="Save visualizations of predictions for debugging")
+    parser.add_argument("--convert_to_bbox", action="store_true", help="Convert polygon segmentation to bounding box detection format")
     args = parser.parse_args()
     
-    # Try to import SAM2 if available
+    # Try to import and initialize SAM2
     try:
         from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
         from sam2.build_sam import build_sam2
-        from sam2.utils.misc import variant_to_config_mapping
+        import os.path as osp
+        
+        # Define model path
+        project_root = os.getcwd()  # This will give you the repo root directory
+
+        # Construct the model path relative to the project root
+        model_path = osp.join(project_root, "models", "sam2.1_hiera_small.pt")  # Include .1 in filename
+        model_cfg = "configs/sam2.1/sam2.1_hiera_s.yaml"
         
         # Initialize SAM model
         print("Initializing SAM2 model...")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        model = build_sam2(
-            variant_to_config_mapping["small"],
-            "../models/sam2_hiera_small.pt",
-        )
+
+        model = build_sam2(model_cfg, model_path, device=device)
         
         sam_model = SAM2AutomaticMaskGenerator(
             model,
@@ -443,9 +525,10 @@ def main():
             device=device,
         )
         print("SAM2 model initialized successfully")
-    except ImportError:
-        print("SAM2 model not available, will use placeholder masks")
-        sam_model = None
+    except ImportError as e:
+        print(f"SAM2 is required but not available: {e}")
+        print("Please install SAM2 and its dependencies. Exiting.")
+        sys.exit(1)
     
     # Create and run the auto-annotator
     annotator = AutoAnnotator(
@@ -464,6 +547,15 @@ def main():
         print(f"Initially unlabeled: {result['unlabeled_images']}")
         print(f"Newly annotated: {result['annotated_images']}")
         print(f"Annotation success rate: {result['annotated_images'] / max(1, result['unlabeled_images']) * 100:.1f}%")
+        
+        # Add conversion step if requested
+        if args.convert_to_bbox:
+            output_dir = args.output_dir if args.output_dir else args.input_dir
+            labels_dir = Path(output_dir) / "labels"
+            if labels_dir.exists():
+                print("\nConverting segmentation masks to detection format...")
+                converted_count = convert_all_label_files(labels_dir)
+                print(f"Converted {converted_count} label files from polygon to detection format")
     else:
         print(f"\nAnnotation failed: {result.get('error', 'Unknown error')}")
 
