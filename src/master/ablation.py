@@ -181,8 +181,6 @@ class AblationStudy:
                 continue
                 
             # Get ground truth masks for this image
-            # Assuming val_gt_masks is organized the same way as val_prediction_data
-            image_gt_masks = val_gt_masks[i] if i < len(val_gt_masks) else []
 
             classifier_name, _ = model.get_types()
 
@@ -204,20 +202,14 @@ class AblationStudy:
             self.logger.debug(f"Probabilities length: {len(probs)}")
             # Extract positive predictions
             image_pred_masks = []
-            image_pred_probs = []
-            for (mask, pred_class), prob in zip(pred_results, probs):
-                # Only keep masks predicted as positive (class 1)
-                if pred_class == 1:
-                    image_pred_masks.append(mask)
-                    image_pred_probs.append(prob[1] if len(prob) > 1 else prob[0])
+            image_pred_masks = [mask for mask, class_label in pred_results if class_label == 1]
             
             # Save predictions for return if needed
             all_pred_masks.extend(image_pred_masks)
-            all_pred_probs.extend(image_pred_probs)
             
             # Evaluate this image immediately
-            if len(image_gt_masks) > 0 and len(image_pred_masks) > 0:
-                image_metrics = evaluate_binary_masks(image_gt_masks, image_pred_masks)
+            if len(val_gt_masks) > 0 and len(image_pred_masks) > 0:
+                image_metrics = evaluate_binary_masks(val_gt_masks, image_pred_masks)
                 all_metrics.append(image_metrics)
         
         # Calculate average inference time
@@ -868,13 +860,13 @@ class AblationStudy:
         self.current_classifier = None
         
         # Save all grid search results
-        self._save_grid_search_results(dataset_name, embedding_name, classifier_name, all_results)
+        # self._save_grid_search_results(dataset_name, embedding_name, classifier_name, all_results)
         
         return best_config
     
     # First, add this as a new method to the AblationStudy class
     def _process_fold_and_size(self, task, dataset_name, embedding_name, classifier_name,
-                            embedding_config, classifier_config):
+                           embedding_config, classifier_config):
         """Worker function to process a specific fold and training size"""
         fold_idx, train_size, subset_idx = task
         
@@ -889,10 +881,19 @@ class AblationStudy:
         # Calculate information content (number of GT masks) for each training image
         image_info_scores = []
         for i, masks in enumerate(all_train_masks):
-            # Count the number of ground truth masks (where label is 1)
-            gt_mask_count = sum(1 for j, label in enumerate(all_train_labels[i]) 
-                            if label == 1)
-            image_info_scores.append((i, gt_mask_count))
+            try:
+                # Count the number of ground truth masks (where label is 1)
+                # Handle different label types safely
+                gt_mask_count = 0
+                for j, label in enumerate(all_train_labels[i]):
+                    if isinstance(label, (int, float)) and label == 1:
+                        gt_mask_count += 1
+                    elif isinstance(label, (list, np.ndarray)) and len(label) > 0 and label[0] == 1:
+                        gt_mask_count += 1
+                image_info_scores.append((i, gt_mask_count))
+            except Exception as e:
+                self.logger.error(f"Error calculating GT count for image {i}: {e}")
+                image_info_scores.append((i, 0))  # Default to 0 masks
         
         # Sort by information content (highest number of GT masks first)
         image_info_scores.sort(key=lambda x: x[1], reverse=True)
@@ -936,17 +937,31 @@ class AblationStudy:
             metrics['train_size'] = train_size
             
             # Save precision-recall curve for this fold and subset
-            val_gt_masks = [item[2] for item in val_data]  # Get gt_masks from each tuple
-
-            self._save_pr_curve(
-                val_gt_masks, val_pred_masks, val_pred_probs,
-                f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
-                f"{fold_idx}_{subset_idx}"
-            )
+            # Extract ground truth masks correctly
+            flat_gt_masks = []
+            for item in val_data:
+                if len(item) >= 3 and item[2]:  # Check if the tuple has gt_masks
+                    if isinstance(item[2], list):
+                        flat_gt_masks.extend(item[2])  # Add all masks in this list
+                    else:
+                        flat_gt_masks.append(item[2])  # Add this single mask
+            
+            # Now we have a flat list of gt_masks
+            if flat_gt_masks and val_pred_masks:
+                try:
+                    self._save_pr_curve(
+                        flat_gt_masks, val_pred_masks, val_pred_probs,
+                        f"{dataset_name}_size{train_size}", embedding_name, classifier_name, 
+                        f"{fold_idx}_{subset_idx}"
+                    )
+                except Exception as e:
+                    self.logger.error(f"Error saving PR curve: {e}")
+                    # Continue even if PR curve fails
             
             return metrics
         except Exception as e:
             self.logger.error(f"Error processing fold {fold_idx}, size {train_size}, subset {subset_idx}: {e}")
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
             return None
         finally:
             # Use dedicated cleanup helper
@@ -1045,7 +1060,7 @@ class AblationStudy:
         self._save_training_size_metrics(dataset_name, embedding_name, classifier_name, final_metrics)
         
         # Plot learning curve
-        self._plot_learning_curve(dataset_name, embedding_name, classifier_name, final_metrics)
+        # self._plot_learning_curve(dataset_name, embedding_name, classifier_name, final_metrics)
         
         return final_metrics
 
@@ -1412,16 +1427,16 @@ def create_hyperparameter_grid():
     grid_config = {
         # Embedding hyperparameters
         'CLIP': {
-            'padding': [0, 5, 10],
+            'padding': [0, 5],
             'clip_model': ['ViT-B/32']
         },
         'HOG': {
-            'padding': [0, 5, 10],
+            'padding': [5],
             'hog_cell_size': [(8, 8), (16, 16)],
             'hog_block_size': [(2, 2), (3, 3)]
         },
         'ResNet18': {
-            'padding': [0, 5, 10],
+            'padding': [0, 5],
             'layers': [[2, 4, 6, 8]]
         },
         

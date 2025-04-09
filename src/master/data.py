@@ -296,6 +296,7 @@ class KFoldSegmentationManager:
         for batch in dataloader:
             batch_images = batch['image']
             batch_gt_binary_masks = batch['gt_binary_masks']  # Ground truth masks for validation
+            batch_has_gt = batch['has_gt']  # Get the has_gt flag
             
             # Choose which candidate masks to use based on the mode
             if return_combined:
@@ -317,7 +318,7 @@ class KFoldSegmentationManager:
                 gt_masks = batch_gt_binary_masks[i]
                 
                 # Only add to prediction data if there are candidate masks
-                if candidate_masks and len(candidate_masks) > 0:
+                if batch_has_gt[i] and candidate_masks and len(candidate_masks) > 0:
                     prediction_data.append((image, candidate_masks, gt_masks))
                 
         return prediction_data
