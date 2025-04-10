@@ -43,26 +43,6 @@ class SegmentationReportGenerator:
         # Generate HTML report base
         self._generate_html_report(all_results, df, dataset_managers)
         
-        # Prepare data structure for additional sections
-        report_data = {}
-        
-        # Extract training size data
-        if 'training_size' in all_results:
-            report_data['training_size'] = all_results['training_size']
-        elif 'ablation' in all_results and 'training_size' in all_results['ablation']:
-            report_data['training_size'] = all_results['ablation']['training_size']
-        
-        # Extract per_dataset for reference in training size section
-        if 'per_dataset' in all_results:
-            report_data['per_dataset'] = all_results['per_dataset']
-        elif 'ablation' in all_results and 'per_dataset' in all_results['ablation']:
-            report_data['per_dataset'] = all_results['ablation']['per_dataset']
-        
-        # Add training size analysis if available
-        if 'training_size' in report_data:
-            with open(os.path.join(self.output_dir, 'ablation_report.html'), 'a') as f:
-                self._add_training_size_section(f, report_data)
-        
         # Extract consistency results
         consistency_results = None
         if 'consistency' in all_results:
@@ -962,10 +942,15 @@ class SegmentationReportGenerator:
         comparison_section += '<img src="pipeline_comparison_overall.png" alt="Pipeline Comparison" style="max-width:90%;"/>'
         comparison_section += '</div>'
         
-        # Dataset-specific comparison
+        # Dataset-specific comparison for each dataset
         comparison_section += '<div style="margin:20px 0;text-align:center">'
         comparison_section += '<h4>Dataset-Specific Comparison</h4>'
-        comparison_section += '<img src="pipeline_comparison_by_dataset.png" alt="Pipeline Comparison by Dataset" style="max-width:90%;"/>'
+        for dataset_name in ideal_results.keys():
+            if dataset_name in realistic_results:
+                comparison_section += f'<div style="margin:15px 0;">'
+                comparison_section += f'<h5>{dataset_name}</h5>'
+                comparison_section += f'<img src="pipeline_comparison_{dataset_name}.png" alt="Pipeline Comparison for {dataset_name}" style="max-width:90%;"/>'
+                comparison_section += '</div>'
         comparison_section += '</div>'
         
         # SAM2 attribution heatmap
@@ -1102,86 +1087,123 @@ class SegmentationReportGenerator:
         plt.savefig(os.path.join(self.output_dir, 'pipeline_comparison_overall.png'), dpi=300)
         plt.close()
         
-        # 2. Dataset-specific comparison
-        # Group by dataset and model to get average performance across datasets
-        dataset_model_summary = comparison_df.groupby(['Dataset', 'Embedding'])[['Ideal_F1', 'Realistic_F1', 'Absolute_Gap']].mean().reset_index()
+        # 2. UPDATED: Dataset-specific comparison with both embeddings and classifiers
+        # Get unique datasets, embeddings, and classifiers
+        datasets = comparison_df['Dataset'].unique()
         
-        # Create a plot for each dataset side by side
-        datasets = dataset_model_summary['Dataset'].unique()
-        embeddings = dataset_model_summary['Embedding'].unique()
-        
-        # Set up plot grid
-        fig, axes = plt.subplots(1, len(datasets), figsize=(15, 6), sharey=True)
-        if len(datasets) == 1:
-            axes = [axes]  # Make sure axes is a list even with one dataset
-        
-        # Color map for embeddings
-        colors = plt.cm.tab10.colors[:len(embeddings)]
-        embedding_colors = {embedding: color for embedding, color in zip(embeddings, colors)}
-        
-        for i, dataset in enumerate(datasets):
-            ax = axes[i]
-            dataset_data = dataset_model_summary[dataset_model_summary['Dataset'] == dataset]
+        # For each dataset, create a grid of embedding vs classifier
+        for dataset_idx, dataset in enumerate(datasets):
+            # Filter data for this dataset
+            dataset_data = comparison_df[comparison_df['Dataset'] == dataset]
             
-            # Sort by ideal F1
-            dataset_data = dataset_data.sort_values('Ideal_F1', ascending=False)
+            # Get unique embeddings and classifiers for this dataset
+            embeddings = dataset_data['Embedding'].unique()
+            classifiers = dataset_data['Classifier'].unique()
             
-            # Width of bars
-            width = 0.35
-            x = np.arange(len(dataset_data))
+            # Calculate grid size and figure dimensions
+            fig_width = min(15, 3.5 * len(classifiers))
+            fig_height = min(10, 3 * len(embeddings))
             
-            # Plot bars
-            for j, (_, row) in enumerate(dataset_data.iterrows()):
-                embedding = row['Embedding']
-                color = embedding_colors[embedding]
+            # Create the figure
+            fig, axes = plt.subplots(len(embeddings), len(classifiers), 
+                                    figsize=(fig_width, fig_height),
+                                    sharex=True, sharey=True)
+            
+            # Handle single embedding or classifier case
+            if len(embeddings) == 1 and len(classifiers) == 1:
+                axes = np.array([[axes]])
+            elif len(embeddings) == 1:
+                axes = np.array([axes])
+            elif len(classifiers) == 1:
+                axes = np.array([axes]).T
                 
-                # Plot ideal and realistic F1 scores
-                ax.bar(j - width/2, row['Ideal_F1'], width, color=color, alpha=0.8, hatch='')
-                ax.bar(j + width/2, row['Realistic_F1'], width, color=color, alpha=0.4, hatch='//') 
-                
-                # Add text for the gap
-                gap = row['Absolute_Gap']
-                ax.annotate(f"Δ: {gap:.2f}", 
-                        xy=(j, (row['Ideal_F1'] + row['Realistic_F1'])/2),
-                        xytext=(0, 0), 
-                        textcoords="offset points",
-                        ha='center', va='center',
-                        fontsize=8,
-                        bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.8))
+            # Set a global title
+            fig.suptitle(f'Pipeline Comparison for {dataset}', fontsize=16)
             
-            # Set labels and title
-            ax.set_title(dataset)
-            ax.set_xticks(x)
-            ax.set_xticklabels([row['Embedding'] for _, row in dataset_data.iterrows()], rotation=45, ha='right')
-            ax.grid(axis='y', linestyle='--', alpha=0.3)
+            # Maximum F1 value for consistent y-axis scaling
+            max_f1 = max(dataset_data['Ideal_F1'].max(), dataset_data['Realistic_F1'].max()) * 1.1
             
-            if i == 0:
-                ax.set_ylabel('F1 Score')
+            # Plot data for each embedding-classifier combination
+            for i, embedding in enumerate(embeddings):
+                for j, classifier in enumerate(classifiers):
+                    ax = axes[i, j]
+                    
+                    # Filter data for this embedding-classifier combination
+                    combo_data = dataset_data[(dataset_data['Embedding'] == embedding) & 
+                                            (dataset_data['Classifier'] == classifier)]
+                    
+                    if combo_data.empty:
+                        ax.text(0.5, 0.5, 'No Data', ha='center', va='center')
+                        continue
+                    
+                    # Get values for this combination
+                    ideal_f1 = combo_data['Ideal_F1'].values[0]
+                    realistic_f1 = combo_data['Realistic_F1'].values[0]
+                    gap = combo_data['Absolute_Gap'].values[0]
+                    
+                    # Create bar positions
+                    x = np.array([0, 1])
+                    
+                    # Plot bars
+                    ax.bar([0], [ideal_f1], width=0.6, color='#2C7BB6', alpha=0.8, label='Ideal')
+                    ax.bar([1], [realistic_f1], width=0.6, color='#D7191C', alpha=0.4, hatch='//', label='Realistic')
+                    
+                    # Add text for the gap
+                    ax.annotate(f"Δ: {gap:.2f}", 
+                            xy=(0.5, (ideal_f1 + realistic_f1)/2),
+                            xytext=(0, 0), 
+                            textcoords="offset points",
+                            ha='center', va='center',
+                            fontsize=9,
+                            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="gray", alpha=0.8))
+                    
+                    # Add F1 value annotations
+                    ax.annotate(f"{ideal_f1:.2f}", xy=(0, ideal_f1), xytext=(0, 3),
+                            textcoords="offset points", ha='center', va='bottom', fontsize=8)
+                    ax.annotate(f"{realistic_f1:.2f}", xy=(1, realistic_f1), xytext=(0, 3),
+                            textcoords="offset points", ha='center', va='bottom', fontsize=8)
+                    
+                    # Format the subplot
+                    ax.set_ylim(0, max_f1)
+                    ax.set_xticks([0, 1])
+                    ax.set_xticklabels(['Ideal', 'Realistic'], rotation=45, ha='right')
+                    
+                    # Add embedding and classifier labels to the edges of the grid
+                    if j == 0:  # First column
+                        ax.set_ylabel(embedding, fontsize=12, rotation=90, labelpad=10)
+                    if i == 0:  # First row
+                        ax.set_title(classifier, fontsize=12)
+                    
+                    # Add grid lines
+                    ax.grid(axis='y', linestyle='--', alpha=0.3)
+            
+            # Add a global y-axis label on the left
+            fig.text(0.02, 0.5, 'F1 Score', va='center', rotation='vertical', fontsize=14)
+            
+            # Add a global x-axis label at the bottom
+            fig.text(0.5, 0.02, 'Pipeline Type', ha='center', fontsize=14)
+            
+            plt.tight_layout()
+            plt.subplots_adjust(top=0.85, bottom=0.15, left=0.1, right=0.95)
+            plt.savefig(os.path.join(self.output_dir, f'pipeline_comparison_{dataset}.png'), dpi=300)
+            plt.close()
         
-        # Create a custom legend for all axes
-        legend_elements = [
-            plt.Rectangle((0,0), 1, 1, color='gray', alpha=0.8, label='Ideal (Perfect Masks)'),
-            plt.Rectangle((0,0), 1, 1, color='gray', alpha=0.4, hatch='//', label='Realistic (SAM2 Masks)')
-        ]
-        fig.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=2)
+        # 3. Create a simplified heatmap to avoid dtype issues
+        plt.figure(figsize=(12, 8))
         
-        plt.tight_layout()
-        plt.subplots_adjust(bottom=0.15)  # Add space at the bottom for the legend
-        plt.savefig(os.path.join(self.output_dir, 'pipeline_comparison_by_dataset.png'), dpi=300)
-        plt.close()
-        
-        # 3. Create a heatmap of SAM2 attribution by dataset and model
+        # Create a pivot table with Dataset as rows and Embedding-Classifier pairs as columns
         heatmap_data = comparison_df.pivot_table(
-            index='Dataset', 
-            columns='Embedding',
+            index='Dataset',
+            columns=['Embedding', 'Classifier'],
             values='SAM2_Attribution',
             aggfunc='mean'
         )
         
-        plt.figure(figsize=(10, 8))
-        ax = plt.gca()
+        # Make sure we have numeric data
+        heatmap_data = heatmap_data.astype(float)
         
         # Create heatmap
+        ax = plt.gca()
         im = ax.imshow(heatmap_data.values, cmap='YlOrRd')
         
         # Add colorbar
@@ -1191,21 +1213,23 @@ class SegmentationReportGenerator:
         # Add labels
         ax.set_xticks(np.arange(len(heatmap_data.columns)))
         ax.set_yticks(np.arange(len(heatmap_data.index)))
-        ax.set_xticklabels(heatmap_data.columns)
-        ax.set_yticklabels(heatmap_data.index)
         
-        # Rotate the tick labels and set their alignment
-        plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+        # Create formatted column labels (Embedding-Classifier)
+        col_labels = [f"{col[0]}-{col[1]}" for col in heatmap_data.columns]
+        ax.set_xticklabels(col_labels, rotation=45, ha="right", rotation_mode="anchor")
+        ax.set_yticklabels(heatmap_data.index)
         
         # Add text annotations
         for i in range(len(heatmap_data.index)):
             for j in range(len(heatmap_data.columns)):
-                value = heatmap_data.iloc[i, j]
-                text = ax.text(j, i, f"{value:.1f}%", 
-                        ha="center", va="center", 
-                        color="white" if value > 50 else "black")
+                # Check if the value exists (not NaN)
+                if not np.isnan(heatmap_data.values[i, j]):
+                    value = heatmap_data.values[i, j]
+                    text = ax.text(j, i, f"{value:.1f}%", 
+                            ha="center", va="center", 
+                            color="white" if value > 50 else "black")
         
-        ax.set_title("SAM2 Error Attribution by Dataset and Embedding")
+        ax.set_title("SAM2 Error Attribution by Dataset and Model")
         plt.tight_layout()
         plt.savefig(os.path.join(self.output_dir, 'sam2_attribution_heatmap.png'), dpi=300)
         plt.close()
