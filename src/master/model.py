@@ -220,7 +220,12 @@ class ResNET18Embedding(Embedding):
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-
+    def _get_hook(self, layer_idx):
+        """Create a hook function that stores output of a specific layer"""
+        def hook(module, input, output):
+            self.feature_maps[layer_idx] = output
+        return hook
+    
     def extract_features(self, image, mask):
         """
         Extract and fuse features from multiple layers of ResNet18
@@ -300,10 +305,6 @@ class ResNET18Embedding(Embedding):
         if hasattr(self, 'feature_maps'):
             self.feature_maps = {}
         
-        # Optional: if using CUDA, clear the cache
-        if hasattr(self, 'device') and self.device == 'cuda':
-            import torch
-            torch.cuda.empty_cache()
 
 class Classifier:
     def __init__(self, config=None, embedding=None):

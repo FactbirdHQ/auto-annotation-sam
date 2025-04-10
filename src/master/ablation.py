@@ -1059,9 +1059,6 @@ class AblationStudy:
         # Save aggregated metrics
         self._save_training_size_metrics(dataset_name, embedding_name, classifier_name, final_metrics)
         
-        # Plot learning curve
-        # self._plot_learning_curve(dataset_name, embedding_name, classifier_name, final_metrics)
-        
         return final_metrics
 
     def _aggregate_subset_metrics(self, subset_metrics):
@@ -1104,38 +1101,6 @@ class AblationStudy:
         
         # Use the generic JSON saving helper
         self._save_to_json(serializable_metrics, output_path)
-
-    def _plot_learning_curve(self, dataset_name, embedding_name, classifier_name, metrics):
-        """Plot learning curve showing how performance scales with training set size"""
-        plt.figure(figsize=(10, 6))
-        
-        # Extract train sizes and F1 scores
-        train_sizes = sorted(metrics.keys())
-        f1_scores = [metrics[size].get('mask_f1', 0) for size in train_sizes]
-        
-        # Plot learning curve
-        plt.plot(train_sizes, f1_scores, 'o-', linewidth=2)
-        plt.xlabel('Training Set Size (Number of Images)')
-        plt.ylabel('F1 Score')
-        plt.title(f'Learning Curve: {dataset_name} with {embedding_name}-{classifier_name}')
-        plt.grid(True)
-        
-        # Add annotations for each point
-        for x, y in zip(train_sizes, f1_scores):
-            plt.annotate(f"{y:.3f}", 
-                    (x, y), 
-                    textcoords="offset points",
-                    xytext=(0, 10), 
-                    ha='center')
-        
-        # Save figure
-        output_path = os.path.join(
-            self.output_dir, 
-            f"{dataset_name}_{embedding_name}_{classifier_name}_learning_curve.png"
-        )
-        plt.tight_layout()
-        plt.savefig(output_path, dpi=300)
-        plt.close()
 
     
     def run_integrated_ablation(self, grid_config):
@@ -1244,7 +1209,7 @@ class AblationStudy:
         comparison_results = self.run_pipeline_comparison()
         
         # Update all_results to include comparison
-        all_results['pipeline_comparison'] = comparison_results
+        self.all_results['pipeline_comparison'] = comparison_results
         
         # Complete results
         all_results = {
@@ -1256,50 +1221,6 @@ class AblationStudy:
         }
         
         return all_results
-    
-    def run_hyperparameter_study(self, grid_config):
-        """
-        Run hyperparameter study for specified configurations
-        
-        Args:
-            grid_config: Dictionary mapping embedding/classifier names to parameter grids
-            
-        Returns:
-            Dictionary with best configurations for each combination
-        """
-        # Ensure datasets are loaded
-        if not self.dataset_managers:
-            self.load_datasets()
-        
-        # Get what to test
-        hp_study_config = self.config.get('hyperparameter_study', {})
-        datasets = hp_study_config.get('datasets', list(self.dataset_managers.keys()))
-        embeddings = hp_study_config.get('embeddings', ['CLIP', 'HOG', 'ResNet18'])
-        classifiers = hp_study_config.get('classifiers', ['KNN', 'SVM', 'RF', 'LR'])
-        
-        # Track best configurations
-        best_configs = {}
-        
-        # Run grid search for each combination
-        for dataset_name in datasets:
-            best_configs[dataset_name] = {}
-            
-            for embedding_name in embeddings:
-                best_configs[dataset_name][embedding_name] = {}
-                
-                for classifier_name in classifiers:
-                    print(f"\nRunning hyperparameter grid search for {dataset_name}, {embedding_name}, {classifier_name}")
-                    
-                    best_config = self.hyperparameter_grid_search(
-                        dataset_name, embedding_name, classifier_name, grid_config
-                    )
-                    
-                    best_configs[dataset_name][embedding_name][classifier_name] = best_config
-                    
-                    # Save best config
-                    self._save_best_config(dataset_name, embedding_name, classifier_name, best_config)
-        
-        return best_configs
     
     def _aggregate_fold_metrics(self, fold_metrics):
         """Aggregate metrics across folds by taking the mean"""
