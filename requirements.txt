@@ -13,3 +13,4 @@ torch==2.6.0+cu118
 torchvision==0.21.0+cu118
 tqdm==4.67.1
 sam2==1.1.0
+lap==0.5.12
