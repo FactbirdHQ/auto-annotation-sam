@@ -14,6 +14,7 @@ import sys
 # Import from the provided files
 from src.master.model import CLIPEmbedding, KNNClassifier
 from src.master.data import load_yolo_masks_as_binary_list, process_segmentation_masks, sort_masks
+from src.master.evaluate import batch_calculate_iou_yolo
 
 class AutoAnnotator:
     def __init__(self, input_dir, output_dir=None, sam_model=None):
@@ -225,7 +226,7 @@ class AutoAnnotator:
                     # Use the largest contour
                     largest_contour = max(contours, key=cv2.contourArea)
                     
-                    # Simplify contour
+                    # Simplify contfour
                     epsilon = 0.005 * cv2.arcLength(largest_contour, True)
                     approx = cv2.approxPolyDP(largest_contour, epsilon, True)
                     
@@ -274,38 +275,71 @@ class AutoAnnotator:
                 # Extract predicted masks (class 1)
                 predicted_masks = []
                 predicted_probs = []
-                
+
                 for (mask, pred_class), prob in zip(pred_results, probabilities):
                     if pred_class == 1:  # Positive class
                         predicted_masks.append(mask)
                         predicted_probs.append(prob[1] if len(prob) > 1 else prob[0])
-                
-                # Sort masks by probability
+
+                # Apply NMS to remove redundant masks
                 if predicted_masks and predicted_probs:
-                    predicted_masks, predicted_probs = sort_masks(predicted_masks, predicted_probs)
+                    # Convert masks to bounding boxes in YOLO format [center_x, center_y, width, height]
+                    boxes = []
+                    for mask in predicted_masks:
+                        # Find bounding box of mask
+                        y_indices, x_indices = np.where(mask > 0)
+                        if len(y_indices) == 0 or len(x_indices) == 0:
+                            continue
+                            
+                        x_min, x_max = np.min(x_indices), np.max(x_indices)
+                        y_min, y_max = np.min(y_indices), np.max(y_indices)
+                        
+                        # Convert to YOLO format (normalized)
+                        center_x = (x_min + x_max) / (2 * image.shape[1])
+                        center_y = (y_min + y_max) / (2 * image.shape[0])
+                        width = (x_max - x_min) / image.shape[1]
+                        height = (y_max - y_min) / image.shape[0]
+                        
+                        boxes.append([center_x, center_y, width, height])
                     
-                    # Determine output path for the label file
-                    image_path_obj = Path(image_path)
-                    image_rel_path = image_path_obj.relative_to(self.input_dir)
+                    if boxes:
+                        boxes = np.array(boxes)
+                        # Apply NMS
+                        keep_indices = self.apply_nms(boxes, np.array(predicted_probs), iou_threshold=0.45)
+                        
+                        # Keep only the masks that survived NMS
+                        filtered_masks = [predicted_masks[i] for i in keep_indices]
+                        
+                        # Sort remaining masks by probability if needed
+                        filtered_probs = [predicted_probs[i] for i in keep_indices]
+                        filtered_masks, _ = sort_masks(filtered_masks, filtered_probs)
+                        
+                        # Update the predicted masks to the filtered ones
+                        predicted_masks = filtered_masks
+                    
+                    if predicted_masks:  # Now contains only the filtered masks
+                        # Determine output path for the label file
+                        image_path_obj = Path(image_path)
+                        image_rel_path = image_path_obj.relative_to(self.input_dir)
 
-                    # Extract subfolder (Train, Validation, Test)
-                    subfolder = image_path_obj.parent.name
+                        # Extract subfolder (Train, Validation, Test)
+                        subfolder = image_path_obj.parent.name
 
-                    # Construct the correct output path
-                    output_dir_path = self.output_dir / "labels" / subfolder
+                        # Construct the correct output path
+                        output_dir_path = self.output_dir / "labels" / subfolder
 
-                    # Check if the directory exists - if not, this is an error
-                    if not output_dir_path.exists():
-                        print(f"Error: Output directory {output_dir_path} does not exist. Please check your dataset structure.")
-                        print(f"Skipping annotation for {image_path}")
-                        continue
+                        # Check if the directory exists - if not, this is an error
+                        if not output_dir_path.exists():
+                            print(f"Error: Output directory {output_dir_path} does not exist. Please check your dataset structure.")
+                            print(f"Skipping annotation for {image_path}")
+                            continue
 
-                    # Create the output path
-                    output_path = output_dir_path / f"{image_path_obj.stem}.txt"
+                        # Create the output path
+                        output_path = output_dir_path / f"{image_path_obj.stem}.txt"
 
-                    # Save the predicted masks as YOLO format
-                    self.save_masks_as_yolo(predicted_masks, image.shape[1], image.shape[0], output_path)
-                    annotated_count += 1
+                        # Save the filtered masks as YOLO format
+                        self.save_masks_as_yolo(predicted_masks, image.shape[1], image.shape[0], output_path)
+                        annotated_count += 1
                     
                     # Optionally save visualization for debugging
                     if hasattr(self, 'save_visualizations') and self.save_visualizations:
@@ -354,6 +388,53 @@ class AutoAnnotator:
         # Save visualization
         output_path = debug_dir / f"{base_name}_prediction.jpg"
         cv2.imwrite(str(output_path), cv2.cvtColor(viz_image, cv2.COLOR_RGB2BGR))
+
+    def apply_nms(self, boxes, scores, iou_threshold=0.45):
+        """
+        Apply Non-Maximum Suppression to bounding boxes.
+        
+        Parameters:
+        boxes: Array of shape (N, 4) with boxes in YOLO format [center_x, center_y, width, height]
+        scores: Array of shape (N) with confidence scores
+        iou_threshold: IoU threshold for considering boxes as duplicates (default: 0.45)
+        score_threshold: Minimum score threshold for considering boxes (default: 0.25)
+        
+        Returns:
+        Array of indices of selected boxes
+        """
+        # Convert to numpy arrays if not already
+        boxes = np.array(boxes)
+        scores = np.array(scores)
+        
+        # If no boxes remain after filtering
+        if len(boxes) == 0:
+            return []
+        
+        # Sort boxes by decreasing scores
+        indices = np.argsort(-scores)
+        boxes = boxes[indices]
+        
+        keep_indices = []
+        
+        while len(boxes) > 0:
+            # Keep the box with highest score
+            keep_indices.append(indices[0])
+            
+            # If only one box is left, we're done
+            if len(boxes) == 1:
+                break
+            
+            # Calculate IoU of the first box with all remaining boxes
+            first_box = boxes[0:1]
+            remaining_boxes = boxes[1:]
+            ious = batch_calculate_iou_yolo(first_box, remaining_boxes)[0]
+            
+            # Keep boxes with IoU less than threshold
+            mask = ious < iou_threshold
+            boxes = remaining_boxes[mask]
+            indices = indices[1:][mask]
+        
+        return np.array(keep_indices)
 
     def run(self, save_visualizations=False):
         """

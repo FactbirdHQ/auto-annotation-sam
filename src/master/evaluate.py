@@ -302,3 +302,57 @@ def plot_threshold_vs_metrics(test_masks_gt, all_masks, sorted_similarities):
     plt.tight_layout()
     
     return fig
+
+def batch_calculate_iou_yolo(bboxes1, bboxes2):
+    """
+    Calculate IoU between each pair of YOLO format bounding boxes in two arrays.
+    
+    Parameters:
+    bboxes1: Array of shape (N, 4) with bboxes in YOLO format [center_x, center_y, width, height]
+    bboxes2: Array of shape (M, 4) with bboxes in YOLO format [center_x, center_y, width, height]
+    
+    Returns:
+    Array of shape (N, M) with IoU values for each pair
+    """
+    bboxes1 = np.array(bboxes1)
+    bboxes2 = np.array(bboxes2)
+    
+    # Convert YOLO format to corners format
+    # Calculate corners for bboxes1
+    bboxes1_corners = np.zeros_like(bboxes1)
+    bboxes1_corners[:, 0] = bboxes1[:, 0] - bboxes1[:, 2] / 2  # x_min
+    bboxes1_corners[:, 1] = bboxes1[:, 1] - bboxes1[:, 3] / 2  # y_min
+    bboxes1_corners[:, 2] = bboxes1[:, 0] + bboxes1[:, 2] / 2  # x_max
+    bboxes1_corners[:, 3] = bboxes1[:, 1] + bboxes1[:, 3] / 2  # y_max
+    
+    # Calculate corners for bboxes2
+    bboxes2_corners = np.zeros_like(bboxes2)
+    bboxes2_corners[:, 0] = bboxes2[:, 0] - bboxes2[:, 2] / 2  # x_min
+    bboxes2_corners[:, 1] = bboxes2[:, 1] - bboxes2[:, 3] / 2  # y_min
+    bboxes2_corners[:, 2] = bboxes2[:, 0] + bboxes2[:, 2] / 2  # x_max
+    bboxes2_corners[:, 3] = bboxes2[:, 1] + bboxes2[:, 3] / 2  # y_max
+    
+    # Expand dimensions to enable broadcasting
+    bboxes1_corners = bboxes1_corners[:, np.newaxis, :]  # Shape: (N, 1, 4)
+    bboxes2_corners = bboxes2_corners[np.newaxis, :, :]  # Shape: (1, M, 4)
+    
+    # Calculate intersection areas
+    x_left = np.maximum(bboxes1_corners[..., 0], bboxes2_corners[..., 0])
+    y_top = np.maximum(bboxes1_corners[..., 1], bboxes2_corners[..., 1])
+    x_right = np.minimum(bboxes1_corners[..., 2], bboxes2_corners[..., 2])
+    y_bottom = np.minimum(bboxes1_corners[..., 3], bboxes2_corners[..., 3])
+    
+    # Calculate width and height of intersection area
+    width = np.maximum(0, x_right - x_left)
+    height = np.maximum(0, y_bottom - y_top)
+    intersection_area = width * height
+    
+    # Calculate areas of individual bounding boxes
+    bboxes1_area = bboxes1[:, 2:4].prod(axis=1)[:, np.newaxis]  # width * height for each bbox in bboxes1
+    bboxes2_area = bboxes2[:, 2:4].prod(axis=1)[np.newaxis, :]  # width * height for each bbox in bboxes2
+    
+    # Calculate IoU
+    union_area = bboxes1_area + bboxes2_area - intersection_area
+    iou = np.where(union_area > 0, intersection_area / union_area, 0)
+    
+    return iou
