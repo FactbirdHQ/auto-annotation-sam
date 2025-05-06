@@ -14,3 +14,15 @@ TODO:
 [X] Double check model hyperparameters (like lasso for LogReg)
 [X] Fix study run order
     [X] Second track
+
+[ ] Improve on YOLO MCDropout either by DropBlock or Find out how to increase Dropout beyond 1-2%
+[ ] Make monitoring Bayesian:
+    [ ] Determine likelihood and priors 
+    [ ] MC inference if needed
+    [ ] Bayes rule for adding clips to baseline
+[ ] Redo monitor test
+    [ ] Retrain model
+    [ ] maybe pick different dataset
+    [ ] pull a lot of data
+    [ ] Redo clips (see if we can get actual grease and recipe changes)
+    [ ] Make an automatic test where we simulate the human-in-the-loop

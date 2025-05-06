@@ -1,0 +1,40 @@
+{
+  "timestamp": "20250430_145054",
+  "num_clips": 10,
+  "clip_paths": [
+    "../data/raw/UncertaintyClips/clip_0017.mp4",
+    "../data/raw/UncertaintyClips/clip_0018.mp4",
+    "../data/raw/UncertaintyClips/clip_0019.mp4",
+    "../data/raw/UncertaintyClips/clip_0020.mp4",
+    "../data/raw/UncertaintyClips/clip_0021.mp4",
+    "../data/raw/UncertaintyClips/clip_0022.mp4",
+    "../data/raw/UncertaintyClips/clip_0023.mp4",
+    "../data/raw/UncertaintyClips/clip_0024.mp4",
+    "../data/raw/UncertaintyClips/clip_0025.mp4",
+    "../data/raw/UncertaintyClips/clip_0026.mp4"
+  ],
+  "labels": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    1,
+    1,
+    1,
+    1
+  ],
+  "clip_lengths": [
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10,
+    10
+  ]
+}

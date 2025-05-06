@@ -1,13 +1,103 @@
 import numpy as np
-import os
-import time
-import json
-import torch
-import cv2
 import pandas as pd
 from collections import defaultdict
+import numpy as np
+from scipy.stats import gamma
+import matplotlib.pyplot as plt
 from ultralytics import YOLO
 import torch.nn.functional as F
+
+class MCDropoutTracker:
+    def __init__(self, model_path, dropout_rate=0.05):
+        self.model_path = model_path
+        self.dropout_rate = dropout_rate
+        # Initialize model for immediate use if needed
+        self.model = self._create_fresh_model()
+        
+    def _create_fresh_model(self):
+        """Create a fresh model instance with dropout applied"""
+        # Load a new model instance
+        model = YOLO(self.model_path)
+        
+        # Find detection head
+        detect_head = None
+        for module in model.model.modules():
+            if 'Detect' in str(type(module)):
+                detect_head = module
+                break
+                
+        if detect_head is None:
+            raise ValueError("Could not find detection head")
+            
+        # Store original forward method
+        original_forward = detect_head.forward
+        
+        # Define new forward with dropout
+        def forward_with_dropout(x, *args, **kwargs):
+            # Apply dropout to feature maps
+            if isinstance(x, list):
+                x = [F.dropout(xi, p=self.dropout_rate, training=True) for xi in x]
+            else:
+                x = F.dropout(x, p=self.dropout_rate, training=True)
+            
+            # Call original forward
+            return original_forward(x, *args, **kwargs)
+            
+        # Replace forward method
+        detect_head.forward = forward_with_dropout
+        
+        # Set to train mode to enable dropout
+        model.model.train()
+        
+        return model
+    
+    def fine_tune(self, data_yaml, epochs=5, batch_size=16, reset_model=False, **kwargs):
+        """Fine-tune the model with dropout enabled
+        
+        Args:
+            data_yaml: Path to data YAML file
+            epochs: Number of training epochs
+            batch_size: Batch size for training
+            reset_model: Whether to create a fresh model before fine-tuning
+            **kwargs: Additional arguments for YOLO training
+        """
+        # Create a fresh model if requested or if model doesn't exist
+        if reset_model or not hasattr(self, 'model'):
+            self.model = self._create_fresh_model()
+        
+        # Make sure dropout is active during training
+        self.model.model.train()
+        
+        # Start fine-tuning
+        results = self.model.train(
+            data=data_yaml,
+            epochs=epochs,
+            batch=batch_size,
+            **kwargs
+        )
+        
+        return results
+    
+    def track(self, source, fresh_model=True, **kwargs):
+        """Run tracking with MC dropout enabled
+        
+        Args:
+            source: Source for tracking (video, image, etc.)
+            fresh_model: Whether to create a fresh model for this tracking session
+            **kwargs: Additional arguments for YOLO tracking
+        """
+        # Create a fresh model if requested
+        if fresh_model:
+            tracking_model = self._create_fresh_model()
+        else:
+            # Use existing model (ensure it's in train mode for dropout)
+            if not hasattr(self, 'model'):
+                self.model = self._create_fresh_model()
+            tracking_model = self.model
+            tracking_model.model.train()
+        
+        # Run tracking
+        return tracking_model.track(source, **kwargs)
 
 def run_mc_tracking_analysis(model_path, video_path, num_runs=10, dropout_rate=0.01):
     """
@@ -149,826 +239,544 @@ def run_mc_tracking_analysis(model_path, video_path, num_runs=10, dropout_rate=0
     
     return df_stats, all_confidences, all_track_lifespans, frame_confidence_variances
 
-class MCDropoutTracker:
-    def __init__(self, model_path, dropout_rate=0.05):
-        self.model_path = model_path
-        self.dropout_rate = dropout_rate
-        # Initialize model for immediate use if needed
-        self.model = self._create_fresh_model()
+class YOLOPerformanceMonitor:
+    def __init__(self, buffer_factor=0.95, min_deviation_threshold=0.2):
+        """
+        Initialize YOLOv8 performance monitor with likelihood-based approach
         
-    def _create_fresh_model(self):
-        """Create a fresh model instance with dropout applied"""
-        # Load a new model instance
-        model = YOLO(self.model_path)
+        Parameters:
+        - buffer_factor: Factor applied to minimum baseline likelihood (lower = more sensitive)
+                        Default 0.95 means threshold is set 5% below minimum baseline likelihood
+        - min_deviation_threshold: minimum relative deviation to be considered practically significant
+        """
+        self.buffer_factor = buffer_factor
+        self.min_deviation_threshold = min_deviation_threshold
+        self.distribution_params = None
+        self.baseline_clips_raw = []
+        self.baseline_likelihoods = []
+        self.likelihood_threshold = None
+        self.baseline_mean_variance = None
+    
+    def establish_baseline(self, baseline_clips, visualize=False):
+        """
+        Establish baseline using all frame-level data from good clips
         
-        # Find detection head
-        detect_head = None
-        for module in model.model.modules():
-            if 'Detect' in str(type(module)):
-                detect_head = module
-                break
-                
-        if detect_head is None:
-            raise ValueError("Could not find detection head")
-            
-        # Store original forward method
-        original_forward = detect_head.forward
+        Parameters:
+        - baseline_clips: list of frame variance arrays from good clips
+        - visualize: whether to visualize the baseline distributions
         
-        # Define new forward with dropout
-        def forward_with_dropout(x, *args, **kwargs):
-            # Apply dropout to feature maps
-            if isinstance(x, list):
-                x = [F.dropout(xi, p=self.dropout_rate, training=True) for xi in x]
+        Returns:
+        - baseline_info: dictionary with baseline statistics
+        """
+        # Store raw baseline clips
+        self.baseline_clips_raw = baseline_clips
+        
+        # 1. Combine all frame variances from all baseline clips
+        all_frame_variances = []
+        for clip in baseline_clips:
+            if isinstance(clip, (list, np.ndarray)):
+                all_frame_variances.extend(clip)
             else:
-                x = F.dropout(x, p=self.dropout_rate, training=True)
-            
-            # Call original forward
-            return original_forward(x, *args, **kwargs)
-            
-        # Replace forward method
-        detect_head.forward = forward_with_dropout
+                all_frame_variances.extend([clip])  # Handle scalar case
         
-        # Set to train mode to enable dropout
-        model.model.train()
+        # Calculate baseline mean variance (needed for practical significance)
+        self.baseline_mean_variance = np.mean(all_frame_variances)
         
-        return model
-    
-    def fine_tune(self, data_yaml, epochs=5, batch_size=16, reset_model=False, **kwargs):
-        """Fine-tune the model with dropout enabled
+        # 2. Fit a gamma distribution to the combined data
+        # (Gamma is appropriate for variance data as it's always positive)
+        try:
+            self.distribution_params = gamma.fit(all_frame_variances)
+            self.distribution_type = "gamma"
+        except Exception as e:
+            print(f"Error fitting gamma distribution: {e}")
+            print("Using normal distribution instead")
+            # Fallback to normal distribution if gamma fit fails
+            self.mean = np.mean(all_frame_variances)
+            self.std = np.std(all_frame_variances)
+            self.distribution_type = "normal"
         
-        Args:
-            data_yaml: Path to data YAML file
-            epochs: Number of training epochs
-            batch_size: Batch size for training
-            reset_model: Whether to create a fresh model before fine-tuning
-            **kwargs: Additional arguments for YOLO training
-        """
-        # Create a fresh model if requested or if model doesn't exist
-        if reset_model or not hasattr(self, 'model'):
-            self.model = self._create_fresh_model()
+        # 3. Calculate likelihood scores for each baseline clip
+        self.baseline_likelihoods = []
+        for clip in baseline_clips:
+            if self.distribution_type == "gamma":
+                # Calculate log-likelihood for numerical stability
+                log_likelihoods = gamma.logpdf(clip, *self.distribution_params)
+                mean_log_likelihood = np.mean(log_likelihoods)
+                self.baseline_likelihoods.append(mean_log_likelihood)
+            else:
+                # Use normal distribution as fallback
+                log_likelihoods = -0.5 * ((np.array(clip) - self.mean) / self.std) ** 2
+                mean_log_likelihood = np.mean(log_likelihoods)
+                self.baseline_likelihoods.append(mean_log_likelihood)
         
-        # Make sure dropout is active during training
-        self.model.model.train()
+        # 4. Set threshold as buffer_factor * minimum baseline likelihood
+        min_baseline_likelihood = min(self.baseline_likelihoods)
+        self.likelihood_threshold = min_baseline_likelihood * self.buffer_factor
         
-        # Start fine-tuning
-        results = self.model.train(
-            data=data_yaml,
-            epochs=epochs,
-            batch=batch_size,
-            **kwargs
-        )
-        
-        return results
-    
-    def track(self, source, fresh_model=True, **kwargs):
-        """Run tracking with MC dropout enabled
-        
-        Args:
-            source: Source for tracking (video, image, etc.)
-            fresh_model: Whether to create a fresh model for this tracking session
-            **kwargs: Additional arguments for YOLO tracking
-        """
-        # Create a fresh model if requested
-        if fresh_model:
-            tracking_model = self._create_fresh_model()
-        else:
-            # Use existing model (ensure it's in train mode for dropout)
-            if not hasattr(self, 'model'):
-                self.model = self._create_fresh_model()
-            tracking_model = self.model
-            tracking_model.model.train()
-        
-        # Run tracking
-        return tracking_model.track(source, **kwargs)
-
-
-class UncertaintyMonitor:
-    """
-    Monitor YOLOv8 model performance using uncertainty estimates from MC Dropout.
-    
-    This class handles:
-    1. Running MC Dropout on video clips
-    2. Matching objects across multiple passes
-    3. Calculating aleatoric and epistemic uncertainties
-    4. Alerting when uncertainties deviate from baseline
-    5. Diagnosing potential issues (grease, recipe changes)
-    """
-    
-    def __init__(self, model_path, 
-                 conf_threshold=0.5, 
-                 iou_threshold=0.5,
-                 mc_passes=10,
-                 alert_thresholds=None):
-        """
-        Initialize the uncertainty monitor.
-        
-        Args:
-            model_path (str): Path to YOLOv8 model
-            conf_threshold (float): Confidence threshold for detection
-            iou_threshold (float): IoU threshold for matching detections across MC runs
-            mc_passes (int): Number of MC Dropout passes to run
-            alert_thresholds (dict): Thresholds for alerting on uncertainty values
-        """
-        self.model = MCDropoutTracker(model_path, dropout_rate=0.01)
-        self.conf_threshold = conf_threshold
-        self.iou_threshold = iou_threshold
-        self.mc_passes = mc_passes
-        self.baseline_established = False
-        
-        # Default alert thresholds (standard deviations from baseline)
-        if alert_thresholds is None:
-            self.alert_thresholds = {
-                'aleatoric_z_threshold': 3.0,  # Z-score threshold for aleatoric uncertainty
-                'epistemic_z_threshold': 3.0,  # Z-score threshold for epistemic uncertainty
-                'ratio_threshold': 2.0,        # Threshold for ratio change (current/baseline)
-            }
-        else:
-            self.alert_thresholds = alert_thresholds
-        
-        # Baseline statistics
-        self.baseline_stats = {
-            'aleatoric': {'mean': None, 'std': None},
-            'epistemic': {'mean': None, 'std': None},
-            'ratio': {'mean': None, 'std': None},
-            'samples': 0
-        }
-        
-        # History tracking
-        self.history = []
-        
-
-        
-    def process_clip(self, clip_path, save_results=False, output_dir=None):
-        """
-        Process a video clip through MC Dropout and calculate uncertainties.
-        
-        Args:
-            clip_path (str): Path to video clip
-            save_results (bool): Whether to save visualization results
-            output_dir (str): Directory to save results in (if save_results=True)
-            
-        Returns:
-            dict: Dictionary of uncertainty metrics and analysis results
-        """
-        # Run MC Dropout passes
-        mc_results = self._run_mc_dropout(clip_path)
-        
-        # Match objects across MC runs
-        matched_objects = self._match_objects_across_runs(mc_results)
-        
-        # Calculate uncertainties
-        uncertainties = self._calculate_uncertainties(matched_objects)
-        
-        # Check for issues if baseline established
-        issues = None
-        if self.baseline_established:
-            issues = self._detect_issues(uncertainties)
-            uncertainties['issues'] = issues
-        
-        # Save history
-        self.history.append({
-            'timestamp': time.time(),
-            'clip_path': clip_path,
-            'uncertainties': uncertainties,
-            'issues': issues
-        })
-        
-        # Optionally save visualization
-        if save_results and output_dir is not None:
-            self._save_visualization(clip_path, mc_results, matched_objects, uncertainties, output_dir)
-        
-        return uncertainties
-    
-    def _run_mc_dropout(self, clip_path):
-        """
-        Run multiple passes of YOLOv8 with dropout enabled.
-        
-        Args:
-            clip_path (str): Path to video clip
-            
-        Returns:
-            list: Results from each MC Dropout pass
-        """
-        # For simplicity, we'll use the first frame of the clip
-        # In a real implementation, you'd process the entire clip or select frames
-        cap = cv2.VideoCapture(clip_path)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            raise ValueError(f"Failed to read clip: {clip_path}")
-        
-        # Run MC Dropout passes
-        mc_results = []
-        
-        for _ in range(self.mc_passes):
-            # Run YOLOv8 with dropout enabled
-            results = self.model(frame, verbose=False)
-            
-            # Extract detection results
-            detections = []
-            if len(results) > 0:
-                for r in results[0].boxes.data.cpu().numpy():
-                    x1, y1, x2, y2, conf, cls_id = r
-                    
-                    # Only include detections above threshold
-                    if conf >= self.conf_threshold:
-                        detections.append({
-                            'box': [x1, y1, x2, y2],
-                            'confidence': float(conf),
-                            'class_id': int(cls_id)
-                        })
-            
-            mc_results.append(detections)
-            
-        return mc_results
-    
-    def _calculate_iou(self, box1, box2):
-        """
-        Calculate IoU between two bounding boxes.
-        
-        Args:
-            box1, box2: Bounding boxes in format [x1, y1, x2, y2]
-            
-        Returns:
-            float: IoU value
-        """
-        # Calculate intersection area
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-        
-        if x2 < x1 or y2 < y1:
-            return 0.0
-            
-        intersection_area = (x2 - x1) * (y2 - y1)
-        
-        # Calculate union area
-        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-        union_area = box1_area + box2_area - intersection_area
-        
-        # Calculate IoU
-        iou = intersection_area / union_area if union_area > 0 else 0.0
-        
-        return iou
-    
-    def _match_objects_across_runs(self, mc_results):
-        """
-        Match the same objects across different MC Dropout runs.
-        
-        Args:
-            mc_results: List of detection results from MC Dropout passes
-            
-        Returns:
-            list: List of matched object groups
-        """
-        # Start with first run's detections
-        if not mc_results or len(mc_results) == 0 or len(mc_results[0]) == 0:
-            return []
-            
-        matched_groups = [[det] for det in mc_results[0]]
-        
-        # For each subsequent run
-        for run_idx in range(1, len(mc_results)):
-            current_detections = mc_results[run_idx]
-            unmatched_current = list(range(len(current_detections)))
-            
-            # For each existing group
-            for group in matched_groups:
-                last_det = group[-1]
-                best_match_idx = -1
-                best_match_iou = self.iou_threshold  # Minimum threshold
-                
-                # Find best match in current run
-                for i in unmatched_current:
-                    current_det = current_detections[i]
-                    iou = self._calculate_iou(last_det['box'], current_det['box'])
-                    if iou > best_match_iou:
-                        best_match_iou = iou
-                        best_match_idx = i
-                
-                # If match found, add to group and mark as matched
-                if best_match_idx >= 0:
-                    group.append(current_detections[best_match_idx])
-                    unmatched_current.remove(best_match_idx)
-            
-            # Add any unmatched detections as new groups
-            for i in unmatched_current:
-                matched_groups.append([current_detections[i]])
-        
-        # Filter groups to only include those that appear in at least half the runs
-        min_runs = len(mc_results) / 2
-        consistent_groups = [group for group in matched_groups if len(group) >= min_runs]
-        
-        return consistent_groups
-    
-    def _calculate_uncertainties(self, matched_objects):
-        """
-        Calculate aleatoric and epistemic uncertainties from matched objects.
-        
-        Args:
-            matched_objects: List of matched object groups
-            
-        Returns:
-            dict: Dictionary of uncertainty metrics
-        """
-        if not matched_objects:
-            return {
-                'detection_count': 0,
-                'mean_confidence': 0,
-                'mean_aleatoric': 0,
-                'mean_epistemic': 0,
-                'mean_position_variance': 0,
-                'aleatoric_epistemic_ratio': 0
-            }
-        
-        # Calculate per-object uncertainties
-        object_metrics = []
-        
-        for obj_group in matched_objects:
-            # Confidence scores for this object across MC runs
-            confidence_scores = [det['confidence'] for det in obj_group]
-            
-            # Calculate mean confidence
-            mean_confidence = np.mean(confidence_scores)
-            
-            # Calculate aleatoric uncertainty (predictive entropy)
-            # For classification/detection, related to confidence score: p*(1-p)
-            aleatoric = np.mean([(1 - score) * score for score in confidence_scores])
-            
-            # Calculate epistemic uncertainty (variance of predictions)
-            epistemic = np.var(confidence_scores)
-            
-            # Calculate position variance
-            box_centers = [
-                ((det['box'][0] + det['box'][2]) / 2, (det['box'][1] + det['box'][3]) / 2) 
-                for det in obj_group
-            ]
-            position_var = np.var(box_centers, axis=0).mean()
-            
-            object_metrics.append({
-                'mean_confidence': mean_confidence,
-                'aleatoric': aleatoric,
-                'epistemic': epistemic,
-                'position_variance': position_var
-            })
-        
-        # Aggregate metrics across all objects
-        mean_confidence = np.mean([m['mean_confidence'] for m in object_metrics])
-        mean_aleatoric = np.mean([m['aleatoric'] for m in object_metrics])
-        mean_epistemic = np.mean([m['epistemic'] for m in object_metrics])
-        mean_position_var = np.mean([m['position_variance'] for m in object_metrics])
-        
-        # Calculate ratio of aleatoric to epistemic uncertainty
-        # Useful for diagnosing issue type
-        ratio = mean_aleatoric / mean_epistemic if mean_epistemic > 0 else float('inf')
+        if visualize:
+            self.visualize_baseline()
         
         return {
-            'detection_count': len(matched_objects),
-            'mean_confidence': mean_confidence,
-            'mean_aleatoric': mean_aleatoric,
-            'mean_epistemic': mean_epistemic,
-            'mean_position_variance': mean_position_var,
-            'aleatoric_epistemic_ratio': ratio
+            'distribution_params': self.distribution_params,
+            'distribution_type': self.distribution_type,
+            'likelihood_threshold': self.likelihood_threshold,
+            'baseline_mean_variance': self.baseline_mean_variance,
+            'baseline_likelihoods': self.baseline_likelihoods,
+            'min_baseline_likelihood': min_baseline_likelihood,
+            'buffer_factor': self.buffer_factor
         }
     
-    def establish_baseline(self, clip_paths):
+    def check_performance(self, clip_variances):
         """
-        Establish baseline statistics from known good clips.
+        Check if clip indicates performance issues using likelihood-based approach
         
-        Args:
-            clip_paths (list): List of paths to good video clips
-            
+        Parameters:
+        - clip_variances: frame confidence variances from current clip
+        
         Returns:
-            dict: Baseline statistics
+        - result: detection result with detailed metrics
         """
-        if not clip_paths:
-            raise ValueError("No clips provided for baseline establishment")
+        if self.distribution_params is None:
+            return {'status': 'error', 'message': 'Baseline not established'}
         
-        print(f"Establishing baseline from {len(clip_paths)} clips...")
+        # Calculate mean variance for practical significance
+        mean_variance = np.mean(clip_variances)
         
-        # Process each clip and collect metrics
-        all_metrics = []
+        # Calculate relative deviation for practical significance
+        relative_deviation = (mean_variance - self.baseline_mean_variance) / self.baseline_mean_variance
         
-        for clip_path in clip_paths:
-            results = self.process_clip(clip_path)
-            if results['detection_count'] > 0:  # Only include clips with detections
-                all_metrics.append(results)
+        # Practical significance check
+        is_practically_significant = relative_deviation > self.min_deviation_threshold
         
-        if not all_metrics:
-            raise ValueError("No valid metrics found in baseline clips")
+        # Direction check - positive deviation means worse performance
+        is_worse_direction = relative_deviation > 0
         
-        # Calculate baseline statistics
-        aleatoric_values = [m['mean_aleatoric'] for m in all_metrics]
-        epistemic_values = [m['mean_epistemic'] for m in all_metrics]
-        ratio_values = [m['aleatoric_epistemic_ratio'] for m in all_metrics]
+        # Calculate likelihood score for statistical anomaly check
+        if self.distribution_type == "gamma":
+            # Calculate log-likelihood for numerical stability
+            log_likelihoods = gamma.logpdf(clip_variances, *self.distribution_params)
+            clip_log_likelihood = np.mean(log_likelihoods)
+        else:
+            # Use normal distribution as fallback
+            log_likelihoods = -0.5 * ((np.array(clip_variances) - self.mean) / self.std) ** 2
+            clip_log_likelihood = np.mean(log_likelihoods)
         
-        self.baseline_stats = {
-            'aleatoric': {
-                'mean': np.mean(aleatoric_values),
-                'std': np.std(aleatoric_values)
-            },
-            'epistemic': {
-                'mean': np.mean(epistemic_values),
-                'std': np.std(epistemic_values)
-            },
-            'ratio': {
-                'mean': np.mean(ratio_values),
-                'std': np.std(ratio_values)
-            },
-            'samples': len(all_metrics)
-        }
+        # Statistical anomaly if log-likelihood is below threshold
+        is_statistical_anomaly = clip_log_likelihood < self.likelihood_threshold
         
-        self.baseline_established = True
+        # Calculate likelihood percentile for reporting
+        likelihood_percentile = 100 * np.mean(np.array(self.baseline_likelihoods) < clip_log_likelihood)
         
-        print("Baseline established:")
-        print(f"  Aleatoric: {self.baseline_stats['aleatoric']['mean']:.6f} ± {self.baseline_stats['aleatoric']['std']:.6f}")
-        print(f"  Epistemic: {self.baseline_stats['epistemic']['mean']:.6f} ± {self.baseline_stats['epistemic']['std']:.6f}")
-        print(f"  Ratio: {self.baseline_stats['ratio']['mean']:.2f} ± {self.baseline_stats['ratio']['std']:.2f}")
-        
-        return self.baseline_stats
-    
-    def _detect_issues(self, uncertainties):
-        """
-        Detect issues based on uncertainty values.
-        
-        Args:
-            uncertainties (dict): Current uncertainty metrics
-            
-        Returns:
-            dict: Issue detection results
-        """
-        if not self.baseline_established:
-            return {'error': 'Baseline not established'}
-        
-        if uncertainties['detection_count'] == 0:
-            return {'error': 'No detections in current clip'}
-        
-        # Calculate z-scores
-        aleatoric_z = ((uncertainties['mean_aleatoric'] - self.baseline_stats['aleatoric']['mean']) / 
-                      self.baseline_stats['aleatoric']['std']) if self.baseline_stats['aleatoric']['std'] > 0 else 0
-        
-        epistemic_z = ((uncertainties['mean_epistemic'] - self.baseline_stats['epistemic']['mean']) / 
-                      self.baseline_stats['epistemic']['std']) if self.baseline_stats['epistemic']['std'] > 0 else 0
-        
-        ratio = uncertainties['aleatoric_epistemic_ratio']
-        baseline_ratio = self.baseline_stats['ratio']['mean']
-        ratio_change = ratio / baseline_ratio if baseline_ratio > 0 else float('inf')
-        
-        # Check for issues
-        aleatoric_issue = abs(aleatoric_z) > self.alert_thresholds['aleatoric_z_threshold']
-        epistemic_issue = abs(epistemic_z) > self.alert_thresholds['epistemic_z_threshold']
-        ratio_issue = ratio_change > self.alert_thresholds['ratio_threshold'] or ratio_change < (1 / self.alert_thresholds['ratio_threshold'])
-        
-        has_issue = aleatoric_issue or epistemic_issue
-        
-        # Diagnose issue type
-        issue_type = None
-        if has_issue:
-            if aleatoric_issue and not epistemic_issue:
-                issue_type = 'camera_issue'  # Likely grease on lens
-            elif epistemic_issue and not aleatoric_issue:
-                issue_type = 'recipe_change'  # Likely recipe change
-            else:
-                issue_type = 'multiple_issues'  # Multiple issues detected
+        # Combined decision: must be statistically anomalous, practically significant, and in worse direction
+        has_issue = is_statistical_anomaly and is_practically_significant and is_worse_direction
         
         return {
             'has_issue': has_issue,
-            'issue_type': issue_type,
-            'aleatoric_issue': aleatoric_issue,
-            'epistemic_issue': epistemic_issue,
-            'ratio_issue': ratio_issue,
-            'metrics': {
-                'aleatoric_z': aleatoric_z,
-                'epistemic_z': epistemic_z,
-                'ratio_change': ratio_change
-            }
+            'is_statistical_anomaly': is_statistical_anomaly,
+            'is_practically_significant': is_practically_significant,
+            'is_worse_direction': is_worse_direction,
+            'log_likelihood': clip_log_likelihood,
+            'likelihood_threshold': self.likelihood_threshold,
+            'likelihood_percentile': likelihood_percentile,
+            'mean_variance': mean_variance,
+            'baseline_mean_variance': self.baseline_mean_variance,
+            'relative_deviation': relative_deviation * 100,  # Present as percentage
+            'min_deviation_threshold': self.min_deviation_threshold * 100  # Present as percentage
         }
     
-    def _save_visualization(self, clip_path, mc_results, matched_objects, uncertainties, output_dir):
-        """
-        Save visualization of uncertainty results for debugging/monitoring.
+    def visualize_baseline(self):
+        """Visualize baseline distributions and thresholds"""
+        plt.figure(figsize=(12, 8))
         
-        Args:
-            clip_path (str): Path to original clip
-            mc_results (list): MC Dropout results
-            matched_objects (list): Matched objects across runs
-            uncertainties (dict): Calculated uncertainties
-            output_dir (str): Directory to save results in
-        """
-        os.makedirs(output_dir, exist_ok=True)
+        # 1. Plot all frame variances from baseline clips
+        plt.subplot(2, 1, 1)
         
-        # Extract filename from path
-        clip_name = os.path.splitext(os.path.basename(clip_path))[0]
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        
-        # Save uncertainty metrics to JSON
-        metrics_path = os.path.join(output_dir, f"{clip_name}_{timestamp}_metrics.json")
-        with open(metrics_path, 'w') as f:
-            json.dump(uncertainties, f, indent=2)
-        
-        # Read first frame for visualization
-        cap = cv2.VideoCapture(clip_path)
-        ret, frame = cap.read()
-        cap.release()
-        
-        if not ret:
-            return
-        
-        # Draw bounding boxes from all MC runs with transparency
-        vis_frame = frame.copy()
-        for run_idx, detections in enumerate(mc_results):
-            alpha = 0.3  # Transparency
-            overlay = vis_frame.copy()
-            
-            for det in detections:
-                x1, y1, x2, y2 = map(int, det['box'])
-                confidence = det['confidence']
-                
-                # Draw box with random color based on run index
-                color = [(run_idx * 50) % 255, (run_idx * 80) % 255, (run_idx * 110) % 255]
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-                
-                # Draw confidence
-                cv2.putText(overlay, f"{confidence:.2f}", (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            
-            # Blend overlay with original
-            cv2.addWeighted(overlay, alpha, vis_frame, 1 - alpha, 0, vis_frame)
-        
-        # Draw matched objects with thicker lines
-        for obj_idx, obj_group in enumerate(matched_objects):
-            # Calculate average box
-            avg_box = np.mean([[det['box'][0], det['box'][1], det['box'][2], det['box'][3]] 
-                              for det in obj_group], axis=0).astype(int)
-            
-            # Draw average box
-            x1, y1, x2, y2 = avg_box
-            cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            
-            # Get object metrics
-            conf_scores = [det['confidence'] for det in obj_group]
-            mean_conf = np.mean(conf_scores)
-            aleatoric = np.mean([(1 - score) * score for score in conf_scores])
-            epistemic = np.var(conf_scores)
-            
-            # Draw metrics
-            cv2.putText(vis_frame, f"#{obj_idx}", (x1, y1 - 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            cv2.putText(vis_frame, f"A: {aleatoric:.3f} E: {epistemic:.3f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        
-        # Add summary text
-        summary_text = [
-            f"Detections: {uncertainties['detection_count']}",
-            f"Aleatoric: {uncertainties['mean_aleatoric']:.4f}",
-            f"Epistemic: {uncertainties['mean_epistemic']:.4f}",
-            f"A/E Ratio: {uncertainties['aleatoric_epistemic_ratio']:.2f}"
-        ]
-        
-        # Add issue alert if baseline established
-        if 'issues' in uncertainties and uncertainties['issues']:
-            issues = uncertainties['issues']
-            if issues['has_issue']:
-                issue_color = (0, 0, 255)  # Red for issues
-                issue_text = f"ISSUE: {issues['issue_type']}"
-                summary_text.append(issue_text)
+        # Combine all variances for histogram
+        all_variances = []
+        for clip in self.baseline_clips_raw:
+            if isinstance(clip, (list, np.ndarray)):
+                all_variances.extend(clip)
             else:
-                issue_color = (0, 255, 0)  # Green for normal
-                summary_text.append("Status: Normal")
+                all_variances.append(clip)
         
-        # Draw summary
-        for i, text in enumerate(summary_text):
-            cv2.putText(vis_frame, text, (10, 30 + i * 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        plt.hist(all_variances, bins=50, alpha=0.7, density=True, color='green', 
+                label='Baseline frame variances')
         
-        # Save visualization
-        vis_path = os.path.join(output_dir, f"{clip_name}_{timestamp}_vis.jpg")
-        cv2.imwrite(vis_path, vis_frame)
+        # Plot the fitted distribution
+        x = np.linspace(min(all_variances), max(all_variances), 1000)
+        if self.distribution_type == "gamma":
+            pdf = gamma.pdf(x, *self.distribution_params)
+            plt.plot(x, pdf, 'r-', lw=2, label=f'Fitted gamma distribution')
+        else:
+            pdf = 1/(self.std * np.sqrt(2*np.pi)) * np.exp(-0.5*((x-self.mean)/self.std)**2)
+            plt.plot(x, pdf, 'r-', lw=2, label=f'Fitted normal distribution')
         
-        print(f"Saved visualization to {vis_path}")
+        plt.axvline(x=self.baseline_mean_variance, color='blue', linestyle='--', 
+                   label=f'Mean variance: {self.baseline_mean_variance:.6f}')
+        
+        plt.title('Baseline Frame Variance Distribution')
+        plt.xlabel('Variance')
+        plt.ylabel('Density')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 2. Plot baseline clip likelihoods
+        plt.subplot(2, 1, 2)
+        plt.hist(self.baseline_likelihoods, bins=20, alpha=0.7, color='blue', 
+                label='Baseline clip likelihoods')
+        
+        min_baseline = min(self.baseline_likelihoods)
+        plt.axvline(x=min_baseline, color='green', linestyle='--', 
+                label=f'Min baseline: {min_baseline:.2f}')
+        
+        plt.axvline(x=self.likelihood_threshold, color='red', linestyle='--', 
+                label=f'Threshold ({self.buffer_factor:.2%} of min): {self.likelihood_threshold:.2f}')
+        
+        plt.title('Baseline Log-Likelihood Distribution')
+        plt.xlabel('Mean Log-Likelihood')
+        plt.ylabel('Frequency')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
     
-    def run_test(self, normal_clips, problem_clips, problem_labels=None):
+    def visualize_results(self, test_clips, labels):
         """
-        Run performance test on labeled test set.
+        Visualize test results using likelihood-based approach
         
-        Args:
-            normal_clips (list): Paths to normal operation clips
-            problem_clips (list): Paths to problem clips
-            problem_labels (list): Optional problem type labels
-            
+        Parameters:
+        - test_clips: list of clips to visualize
+        - labels: binary labels (1=issue, 0=good)
+        """
+        # Calculate metrics for each clip
+        likelihoods = []
+        deviations = []
+        mean_variances = []
+        
+        for clip in test_clips:
+            result = self.check_performance(clip)
+            likelihoods.append(result['log_likelihood'])
+            deviations.append(result['relative_deviation'])
+            mean_variances.append(result['mean_variance'])
+        
+        # Create scatter plot
+        plt.figure(figsize=(15, 6))
+        
+        # 1. Statistical Anomaly vs Practical Significance
+        plt.subplot(1, 2, 1)
+        colors = ['green' if label == 0 else 'red' for label in labels]
+        markers = ['o' if label == 0 else 'x' for label in labels]
+        
+        for i, (ll, dev, c, m) in enumerate(zip(likelihoods, deviations, colors, markers)):
+            plt.scatter(ll, dev, color=c, marker=m, s=100)
+        
+        plt.axvline(x=self.likelihood_threshold, color='purple', linestyle='--', 
+                   label=f'Likelihood threshold: {self.likelihood_threshold:.2f}')
+        plt.axhline(y=self.min_deviation_threshold * 100, color='orange', linestyle='--',
+                   label=f'Practical threshold: {self.min_deviation_threshold * 100:.1f}%')
+        
+        plt.title('Statistical Anomaly vs Practical Significance')
+        plt.xlabel('Log-Likelihood (lower = more anomalous)')
+        plt.ylabel('Relative Deviation (%)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Add annotations for the quadrants
+        xmin, xmax = plt.xlim()
+        ymin, ymax = plt.ylim()
+        
+        # Ensure threshold lines are within the plot
+        plt.xlim(min(xmin, self.likelihood_threshold*1.1), max(xmax, self.likelihood_threshold*0.9))
+        plt.ylim(min(ymin, 0), max(ymax, self.min_deviation_threshold*150))
+        
+        # Add text labels for quadrants
+        plt.text(self.likelihood_threshold*0.95, self.min_deviation_threshold*120, 
+                "FALSE NEGATIVES", color='gray', ha='right')
+        plt.text(self.likelihood_threshold*0.95, self.min_deviation_threshold*50, 
+                "TRUE NEGATIVES", color='green', fontweight='bold', ha='right')
+        plt.text(self.likelihood_threshold*1.05, self.min_deviation_threshold*120, 
+                "TRUE POSITIVES", color='red', fontweight='bold', ha='left')
+        plt.text(self.likelihood_threshold*1.05, self.min_deviation_threshold*50, 
+                "FALSE POSITIVES", color='gray', ha='left')
+        
+        # 2. Variance Values
+        plt.subplot(1, 2, 2)
+        
+        plt.scatter(range(len(test_clips)), mean_variances, c=colors, marker='o', s=100)
+        plt.axhline(y=self.baseline_mean_variance, color='blue', linestyle='-', 
+                   label=f'Baseline mean: {self.baseline_mean_variance:.6f}')
+        plt.axhline(y=self.baseline_mean_variance * (1 + self.min_deviation_threshold), 
+                   color='red', linestyle='--',
+                   label=f'Threshold (+{self.min_deviation_threshold*100:.1f}%)')
+        
+        # Add clip labels
+        for i, (var, label) in enumerate(zip(mean_variances, labels)):
+            marker = 'x' if label == 1 else 'o'
+            plt.text(i, var, f"{i}", fontsize=9, ha='center', va='bottom')
+        
+        plt.title('Mean Variance by Clip')
+        plt.xlabel('Clip Index')
+        plt.ylabel('Mean Variance')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Create an additional plot showing likelihood vs. baseline
+        plt.figure(figsize=(10, 6))
+        
+        # Sort clips by likelihood for better visualization
+        sorted_indices = np.argsort(likelihoods)
+        sorted_likelihoods = [likelihoods[i] for i in sorted_indices]
+        sorted_colors = [colors[i] for i in sorted_indices]
+        sorted_labels = [labels[i] for i in sorted_indices]
+        
+        plt.bar(range(len(sorted_likelihoods)), sorted_likelihoods, color=sorted_colors)
+        plt.axhline(y=self.likelihood_threshold, color='red', linestyle='--',
+                   label=f'Threshold: {self.likelihood_threshold:.2f}')
+        
+        # Add clip indices as labels
+        for i, idx in enumerate(sorted_indices):
+            plt.text(i, sorted_likelihoods[i], f"{idx}", fontsize=9, 
+                    ha='center', va='bottom' if sorted_likelihoods[i] > 0 else 'top')
+        
+        plt.title('Log-Likelihood by Clip (Sorted)')
+        plt.xlabel('Sorted Clip Index')
+        plt.ylabel('Log-Likelihood (lower = more anomalous)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def tune_parameters(self, validation_clips, validation_labels, 
+                  buffer_range=(0.85, 0.99), buffer_steps=10,
+                  deviation_range=(0.1, 0.5), deviation_steps=5):
+        """
+        Tune parameters for optimal performance
+        
+        Parameters:
+        - validation_clips: list of clips for validation
+        - validation_labels: binary labels (1=issue, 0=good)
+        - buffer_range: range of buffer factors to try (e.g., 0.85 to 0.99)
+        - buffer_steps: number of buffer factor steps
+        - deviation_range: range of deviation thresholds
+        - deviation_steps: number of deviation threshold steps
+        
         Returns:
-            dict: Test results and metrics
+        - best_params: dictionary with best parameters
         """
-        if not self.baseline_established:
-            raise ValueError("Baseline must be established before running tests")
+        # Generate parameter grid
+        buffer_factors = np.linspace(buffer_range[0], buffer_range[1], buffer_steps)
+        deviations = np.linspace(deviation_range[0], deviation_range[1], deviation_steps)
         
-        results = {
-            'normal': [],
-            'problem': [],
-            'metrics': {}
+        min_baseline_likelihood = min(self.baseline_likelihoods)
+        best_f1 = 0
+        best_params = {
+            'buffer_factor': self.buffer_factor,
+            'deviation': self.min_deviation_threshold
         }
         
-        # Process normal clips
-        for clip_path in normal_clips:
-            uncertainties = self.process_clip(clip_path)
-            results['normal'].append({
-                'clip': clip_path,
-                'uncertainties': uncertainties,
-                'expected_issue': False
-            })
+        results = []
         
-        # Process problem clips
-        for i, clip_path in enumerate(problem_clips):
-            uncertainties = self.process_clip(clip_path)
-            problem_type = problem_labels[i] if problem_labels and i < len(problem_labels) else None
-            results['problem'].append({
-                'clip': clip_path,
-                'uncertainties': uncertainties,
-                'expected_issue': True,
-                'expected_type': problem_type
-            })
+        # Test all parameter combinations
+        for buffer in buffer_factors:
+            for deviation in deviations:
+                # Update parameters
+                self.buffer_factor = buffer
+                self.min_deviation_threshold = deviation
+                
+                # Update likelihood threshold based on buffer factor
+                self.likelihood_threshold = min_baseline_likelihood * buffer
+                
+                # Test all validation clips
+                predictions = []
+                for clip in validation_clips:
+                    result = self.check_performance(clip)
+                    predictions.append(result['has_issue'])
+                
+                # Calculate metrics
+                true_positives = sum(pred and label for pred, label in zip(predictions, validation_labels))
+                false_positives = sum(pred and not label for pred, label in zip(predictions, validation_labels))
+                true_negatives = sum(not pred and not label for pred, label in zip(predictions, validation_labels))
+                false_negatives = sum(not pred and label for pred, label in zip(predictions, validation_labels))
+                
+                # Calculate F1 score
+                precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+                recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                
+                results.append({
+                    'buffer_factor': buffer,
+                    'deviation': deviation,
+                    'precision': precision,
+                    'recall': recall,
+                    'f1': f1,
+                    'true_positives': true_positives,
+                    'false_positives': false_positives,
+                    'true_negatives': true_negatives,
+                    'false_negatives': false_negatives
+                })
+                
+                # Update best parameters
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_params = {'buffer_factor': buffer, 'deviation': deviation}
         
-        # Calculate metrics
-        normal_correct = sum(1 for r in results['normal'] 
-                            if not r['uncertainties']['issues']['has_issue'])
-        problem_correct = sum(1 for r in results['problem'] 
-                             if r['uncertainties']['issues']['has_issue'])
+        # Set to best parameters
+        self.buffer_factor = best_params['buffer_factor']
+        self.min_deviation_threshold = best_params['deviation']
+        self.likelihood_threshold = min_baseline_likelihood * self.buffer_factor
         
-        total = len(normal_clips) + len(problem_clips)
-        accuracy = (normal_correct + problem_correct) / total if total > 0 else 0
+        # Sort results by F1 score
+        sorted_results = sorted(results, key=lambda x: x['f1'], reverse=True)
         
-        # Type accuracy
-        type_correct = 0
-        for r in results['problem']:
-            if (r['uncertainties']['issues']['has_issue'] and 
-                r['expected_type'] == r['uncertainties']['issues']['issue_type']):
-                type_correct += 1
-        
-        type_accuracy = type_correct / len(problem_clips) if problem_clips else 0
-        
-        results['metrics'] = {
-            'normal_accuracy': normal_correct / len(normal_clips) if normal_clips else 0,
-            'problem_detection': problem_correct / len(problem_clips) if problem_clips else 0,
-            'overall_accuracy': accuracy,
-            'type_accuracy': type_accuracy
-        }
-        
-        return results
-    
-    def optimize_thresholds(self, normal_clips, problem_clips, problem_labels=None):
-        """
-        Find optimal thresholds for uncertainty monitoring.
-        
-        Args:
-            normal_clips (list): Paths to normal operation clips
-            problem_clips (list): Paths to problem clips
-            problem_labels (list): Optional problem type labels
-            
-        Returns:
-            dict: Optimal thresholds and performance metrics
-        """
-        if not self.baseline_established:
-            raise ValueError("Baseline must be established before optimizing thresholds")
-        
-        # Process all clips first to avoid reprocessing
-        normal_results = []
-        for clip_path in normal_clips:
-            uncertainties = self.process_clip(clip_path)
-            normal_results.append(uncertainties)
-        
-        problem_results = []
-        for clip_path in problem_clips:
-            uncertainties = self.process_clip(clip_path)
-            problem_results.append(uncertainties)
-        
-        # Try different threshold combinations
-        best_accuracy = 0
-        best_thresholds = None
-        
-        # Grid search for thresholds
-        for aleatoric_z in [2.0, 2.5, 3.0, 3.5]:
-            for epistemic_z in [2.0, 2.5, 3.0, 3.5]:
-                for ratio_threshold in [1.5, 2.0, 2.5, 3.0]:
-                    thresholds = {
-                        'aleatoric_z_threshold': aleatoric_z,
-                        'epistemic_z_threshold': epistemic_z,
-                        'ratio_threshold': ratio_threshold
-                    }
-                    
-                    # Save original thresholds
-                    original_thresholds = self.alert_thresholds.copy()
-                    self.alert_thresholds = thresholds
-                    
-                    # Evaluate with these thresholds
-                    normal_correct = 0
-                    for result in normal_results:
-                        issues = self._detect_issues(result)
-                        normal_correct += 0 if issues['has_issue'] else 1
-                    
-                    problem_correct = 0
-                    for result in problem_results:
-                        issues = self._detect_issues(result)
-                        problem_correct += 1 if issues['has_issue'] else 0
-                    
-                    total = len(normal_results) + len(problem_results)
-                    accuracy = (normal_correct + problem_correct) / total if total > 0 else 0
-                    
-                    # Check if better than current best
-                    if accuracy > best_accuracy:
-                        best_accuracy = accuracy
-                        best_thresholds = thresholds.copy()
-                    
-                    # Restore original thresholds
-                    self.alert_thresholds = original_thresholds
-        
-        # Set to best thresholds
-        if best_thresholds:
-            self.alert_thresholds = best_thresholds
-            print(f"Optimized thresholds: {best_thresholds}")
-            print(f"Best accuracy: {best_accuracy:.2%}")
+        # Visualize parameter impact
+        self.visualize_parameter_impact(results, buffer_factors, deviations)
         
         return {
-            'optimal_thresholds': best_thresholds,
-            'accuracy': best_accuracy
+            'best_params': best_params,
+            'best_f1': best_f1,
+            'all_results': sorted_results[:10]  # Top 10 results
         }
-    
-    def save(self, filepath):
+
+    def visualize_parameter_impact(self, results, buffer_factors, deviations):
         """
-        Save monitor state and baseline statistics to file.
+        Visualize impact of parameters on performance metrics
         
-        Args:
-            filepath (str): Path to save file
+        Parameters:
+        - results: list of results from parameter tuning
+        - buffer_factors: list of buffer factors tried
+        - deviations: list of deviation thresholds tried
         """
-        state = {
-            'baseline_stats': self.baseline_stats,
-            'alert_thresholds': self.alert_thresholds,
-            'baseline_established': self.baseline_established,
-            'history': self.history
+        # Create heatmap data
+        buffer_map = {b: i for i, b in enumerate(buffer_factors)}
+        deviation_map = {d: i for i, d in enumerate(deviations)}
+        
+        f1_matrix = np.zeros((len(deviations), len(buffer_factors)))
+        precision_matrix = np.zeros((len(deviations), len(buffer_factors)))
+        recall_matrix = np.zeros((len(deviations), len(buffer_factors)))
+        
+        for result in results:
+            b_idx = buffer_map[result['buffer_factor']]
+            d_idx = deviation_map[result['deviation']]
+            f1_matrix[d_idx, b_idx] = result['f1']
+            precision_matrix[d_idx, b_idx] = result['precision']
+            recall_matrix[d_idx, b_idx] = result['recall']
+        
+        # Plot heatmaps
+        plt.figure(figsize=(15, 5))
+        
+        # F1 score
+        plt.subplot(1, 3, 1)
+        plt.imshow(f1_matrix, cmap='viridis', aspect='auto')
+        plt.colorbar(label='F1 Score')
+        plt.title('F1 Score by Parameters')
+        plt.xlabel('Buffer Factor')
+        plt.ylabel('Deviation Threshold')
+        plt.xticks(np.arange(len(buffer_factors)), [f'{b:.2f}' for b in buffer_factors], rotation=45)
+        plt.yticks(np.arange(len(deviations)), [f'{d:.2f}' for d in deviations])
+        
+        # Precision
+        plt.subplot(1, 3, 2)
+        plt.imshow(precision_matrix, cmap='viridis', aspect='auto')
+        plt.colorbar(label='Precision')
+        plt.title('Precision by Parameters')
+        plt.xlabel('Buffer Factor')
+        plt.ylabel('Deviation Threshold')
+        plt.xticks(np.arange(len(buffer_factors)), [f'{b:.2f}' for b in buffer_factors], rotation=45)
+        plt.yticks(np.arange(len(deviations)), [f'{d:.2f}' for d in deviations])
+        
+        # Recall
+        plt.subplot(1, 3, 3)
+        plt.imshow(recall_matrix, cmap='viridis', aspect='auto')
+        plt.colorbar(label='Recall')
+        plt.title('Recall by Parameters')
+        plt.xlabel('Buffer Factor')
+        plt.ylabel('Deviation Threshold')
+        plt.xticks(np.arange(len(buffer_factors)), [f'{b:.2f}' for b in buffer_factors], rotation=45)
+        plt.yticks(np.arange(len(deviations)), [f'{d:.2f}' for d in deviations])
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Create an additional figure showing parameter combinations and their F1 scores
+        plt.figure(figsize=(10, 6))
+        
+        # Extract top N parameter combinations
+        top_n = min(10, len(results))
+        top_results = sorted(results, key=lambda x: x['f1'], reverse=True)[:top_n]
+        
+        # Create labels for x-axis
+        labels = [f"B:{r['buffer_factor']:.2f}, D:{r['deviation']:.2f}" for r in top_results]
+        
+        # Plot F1, precision, recall for top combinations
+        f1_values = [r['f1'] for r in top_results]
+        precision_values = [r['precision'] for r in top_results]
+        recall_values = [r['recall'] for r in top_results]
+        
+        x = np.arange(len(labels))
+        width = 0.25
+        
+        plt.bar(x - width, f1_values, width, label='F1 Score', color='purple')
+        plt.bar(x, precision_values, width, label='Precision', color='blue')
+        plt.bar(x + width, recall_values, width, label='Recall', color='green')
+        
+        plt.xlabel('Parameter Combinations')
+        plt.ylabel('Score')
+        plt.title('Top Parameter Combinations Performance')
+        plt.xticks(x, labels, rotation=45, ha='right')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.show()
+    
+    
+    def run_test(self, test_clips, labels):
+        """
+        Run test on labeled clips to evaluate monitor performance
+        
+        Parameters:
+        - test_clips: list of clips to test
+        - labels: binary labels (1=issue, 0=good)
+        
+        Returns:
+        - results: test results with metrics
+        """
+        if self.distribution_params is None:
+            return {'status': 'error', 'message': 'Baseline not established'}
+        
+        # Test each clip
+        results = []
+        for clip, label in zip(test_clips, labels):
+            result = self.check_performance(clip)
+            result['true_label'] = label
+            result['correct'] = (result['has_issue'] == bool(label))
+            results.append(result)
+        
+        # Calculate metrics
+        true_positives = sum(1 for r in results if r['has_issue'] and r['true_label'])
+        false_positives = sum(1 for r in results if r['has_issue'] and not r['true_label'])
+        true_negatives = sum(1 for r in results if not r['has_issue'] and not r['true_label'])
+        false_negatives = sum(1 for r in results if not r['has_issue'] and r['true_label'])
+        
+        accuracy = (true_positives + true_negatives) / len(results) if len(results) > 0 else 0
+        precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+        recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+        
+        return {
+            'results': results,
+            'metrics': {
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1,
+                'true_positives': true_positives,
+                'false_positives': false_positives,
+                'true_negatives': true_negatives,
+                'false_negatives': false_negatives
+            }
         }
-        
-        with open(filepath, 'w') as f:
-            json.dump(state, f, indent=2)
-        
-        print(f"Saved monitor state to {filepath}")
-    
-    def load(self, filepath):
-        """
-        Load monitor state and baseline statistics from file.
-        
-        Args:
-            filepath (str): Path to load file
-        """
-        with open(filepath, 'r') as f:
-            state = json.load(f)
-        
-        self.baseline_stats = state['baseline_stats']
-        self.alert_thresholds = state['alert_thresholds']
-        self.baseline_established = state['baseline_established']
-        self.history = state['history']
-        
-        print(f"Loaded monitor state from {filepath}")
-        
-        if self.baseline_established:
-            print("Baseline statistics:")
-            print(f"  Aleatoric: {self.baseline_stats['aleatoric']['mean']:.6f} ± {self.baseline_stats['aleatoric']['std']:.6f}")
-            print(f"  Epistemic: {self.baseline_stats['epistemic']['mean']:.6f} ± {self.baseline_stats['epistemic']['std']:.6f}")
-            print(f"  Ratio: {self.baseline_stats['ratio']['mean']:.2f} ± {self.baseline_stats['ratio']['std']:.2f}")
-
-
-# Example usage
-if __name__ == "__main__":
-    # Initialize monitor
-    monitor = UncertaintyMonitor(
-        model_path="yolov8n.pt",
-        conf_threshold=0.5,
-        iou_threshold=0.5,
-        mc_passes=10
-    )
-    
-    # Establish baseline from good clips
-    baseline_clips = [
-        "data/good_clip1.mp4",
-        "data/good_clip2.mp4",
-        "data/good_clip3.mp4",
-        "data/good_clip4.mp4",
-        "data/good_clip5.mp4"
-    ]
-    
-    monitor.establish_baseline(baseline_clips)
-    
-    # Process a new clip
-    result = monitor.process_clip("data/new_clip.mp4", save_results=True, output_dir="output")
-    
-    if result['issues']['has_issue']:
-        issue_type = result['issues']['issue_type']
-        print(f"Issue detected: {issue_type}")
-        print(f"Aleatoric Z-score: {result['issues']['metrics']['aleatoric_z']:.2f}")
-        print(f"Epistemic Z-score: {result['issues']['metrics']['epistemic_z']:.2f}")
-    else:
-        print("No issues detected.")
-    
-    # Save monitor state
-    monitor.save("monitor_state.json")
